@@ -105,16 +105,31 @@ export async function refreshHoldings(latest: { report: Report; file: string }):
   let raw: Raw[];
   try { raw = await callHoldings(c.client); } catch (e) { disconnect(); throw e; }
 
+  // Kite can list the same stock on NSE or BSE from one call to the next, so match the exact id first,
+  // then fall back to the trading symbol and keep the report's id. Lines that map to the same stock are merged.
   const known = new Set(latest.report.results.map((r) => r.id));
+  const bySymbol = new Map<string, string>();
+  for (const r of latest.report.results) {
+    const s = r.id.split(":").pop()!;
+    if (!bySymbol.has(s) || r.sources.includes("holding")) bySymbol.set(s, r.id);
+  }
   const missing: string[] = [];
-  const hs = raw.flatMap((h) => {
-    const id = `${h.exchange}:${h.tradingsymbol}`;
+  const merged = new Map<string, { qty: number; cost: number; value: number; ltp: number }>();
+  for (const h of raw) {
+    const raw_id = `${h.exchange}:${h.tradingsymbol}`;
     const qty = Number(h.quantity) + Number(h.t1_quantity ?? 0);
-    if (!qty) return [];
-    if (!known.has(id)) { missing.push(id); return []; }
+    if (!qty) continue;
+    const id = known.has(raw_id) ? raw_id : bySymbol.get(String(h.tradingsymbol));
+    if (!id) { missing.push(raw_id); continue; }
     const avg = Number(h.average_price), ltp = Number(h.last_price) || Number(h.close_price);
-    return [{ id, qty, avg: Math.round(avg * 100) / 100, ltp, value: Math.round(qty * ltp * 100) / 100, cost: Math.round(qty * avg * 100) / 100 }];
-  }).sort((a, b) => b.value - a.value);
+    const m = merged.get(id) ?? { qty: 0, cost: 0, value: 0, ltp };
+    m.qty += qty; m.cost += qty * avg; m.value += qty * ltp; m.ltp = ltp;
+    merged.set(id, m);
+  }
+  const hs = [...merged].map(([id, m]) => ({
+    id, qty: m.qty, avg: Math.round((m.cost / m.qty) * 100) / 100, ltp: m.ltp,
+    value: Math.round(m.value * 100) / 100, cost: Math.round(m.cost * 100) / 100,
+  })).sort((a, b) => b.value - a.value);
   if (!hs.length) throw new Error("Kite returned no holdings that match the screened stocks.");
 
   const now = new Date();
