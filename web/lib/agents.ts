@@ -1,7 +1,7 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { hasClaude, llm } from "./llm";
 import { fetchNews } from "./news";
 import { quantScore } from "./quant";
-import { hasClaude, model, scoreSentiment } from "./sentiment";
+import { scoreSentiment } from "./sentiment";
 import type { Analysis, AgentStep, Report, ScreenResult, Sentiment, Stance } from "./types";
 import { symbolOf } from "./data";
 import { loadRisk, loadScoring } from "./rules";
@@ -70,18 +70,11 @@ export async function analyzeStock(r: ScreenResult, report: Report): Promise<Ana
   let text = `Quant ${q.score} and news ${Math.round(sentiment.score * 100)} give "${stance}".`;
   if (hasClaude() && hasNews) {
     try {
-      const msg = await new Anthropic().messages.create({
-        model: model(),
-        max_tokens: 400,
-        system: "You summarise how a stock measures against a rule-based screen and recent news. You never say buy, sell or hold and never suggest position sizes. Two sentences max, plain text.",
-        messages: [
-          {
-            role: "user",
-            content: `${symbol}: screen signal ${r.signal}; quant score ${q.score}; news ${sentiment.label} (${sentiment.score.toFixed(2)}); news themes ${sentiment.themes.join(", ") || "none"}; flags: ${notes.join(" ") || "none"}; rule-based stance: ${stance}. Explain where quant and news agree or conflict and what to check.`,
-          },
-        ],
-      });
-      text = msg.content.map((b) => (b.type === "text" ? b.text : "")).join("").trim();
+      text = await llm(
+        "You summarise how a stock measures against a rule-based screen and recent news. You never say buy, sell or hold and never suggest position sizes. Two sentences max, plain text.",
+        `${symbol}: screen signal ${r.signal}; quant score ${q.score}; news ${sentiment.label} (${sentiment.score.toFixed(2)}); news themes ${sentiment.themes.join(", ") || "none"}; flags: ${notes.join(" ") || "none"}; rule-based stance: ${stance}. Explain where quant and news agree or conflict and what to check.`,
+        400,
+      );
       synthesis = "claude";
     } catch (e) {
       console.error("synthesis failed:", e);

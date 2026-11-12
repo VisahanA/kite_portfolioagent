@@ -1,8 +1,7 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { hasApiKey, llm } from "./llm";
 import type { Headline, Sentiment } from "./types";
 
-export const hasClaude = () => !!process.env.ANTHROPIC_API_KEY;
-export const model = () => process.env.ANTHROPIC_MODEL || "claude-haiku-5-5";
+export { hasClaude, model } from "./llm";
 
 const POS = ["surge", "rally", "gain", "beat", "record", "profit", "growth", "upgrade", "win", "order", "expansion", "strong", "rise", "jumps", "soars", "approval", "dividend", "outperform", "bullish"];
 const NEG = ["fall", "drop", "plunge", "miss", "loss", "downgrade", "probe", "fraud", "penalty", "fine", "weak", "slump", "cut", "decline", "lawsuit", "resign", "concern", "bearish", "tumbles", "crash", "ban", "default"];
@@ -23,22 +22,14 @@ export async function scoreSentiment(symbol: string, sector: string, items: Head
   if (!items.length)
     return { score: 0, confidence: 0, label: "No news", themes: [], rationale: "No recent headlines found.", method: "none", headlines: [] };
 
-  if (hasClaude()) {
+  if (hasApiKey()) { // model sentiment only via the fast direct API; otherwise the lexicon below
     try {
-      const client = new Anthropic();
       const list = items.map((h, i) => `${i}. ${h.title} (${h.source}, ${h.published.slice(0, 10)})`).join("\n");
-      const msg = await client.messages.create({
-        model: model(),
-        max_tokens: 1200,
-        system: "You are a financial news sentiment analyst for Indian equities. Judge only what the headlines say about the company's business prospects and stock. Reply with JSON only.",
-        messages: [
-          {
-            role: "user",
-            content: `Company symbol: ${symbol} (${sector}).\nHeadlines:\n${list}\n\nReturn JSON: {"scores":[number -1..1 per headline, in order, 0 if irrelevant to this company],"overall":number -1..1,"confidence":number 0..1 (low if few/irrelevant/old headlines),"themes":[up to 4 short strings],"rationale":"max 2 sentences"}`,
-          },
-        ],
-      });
-      const text = msg.content.map((b) => (b.type === "text" ? b.text : "")).join("");
+      const text = await llm(
+        "You are a financial news sentiment analyst for Indian equities. Judge only what the headlines say about the company's business prospects and stock. Reply with JSON only.",
+        `Company symbol: ${symbol} (${sector}).\nHeadlines:\n${list}\n\nReturn JSON: {"scores":[number -1..1 per headline, in order, 0 if irrelevant to this company],"overall":number -1..1,"confidence":number 0..1 (low if few/irrelevant/old headlines),"themes":[up to 4 short strings],"rationale":"max 2 sentences"}`,
+        1200,
+      );
       const j = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
       const overall = Math.max(-1, Math.min(1, Number(j.overall) || 0));
       return {

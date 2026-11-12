@@ -121,3 +121,18 @@ textarea.rules-edit { width: 100%; min-height: 360px; margin-top: 8px; font: 12p
   .app { grid-template-columns: 1fr; } .side { position: static; height: auto; flex-direction: row; flex-wrap: wrap; padding: 10px; } .brand { padding: 4px 8px; } .side .grow, .sidefoot { display: none; }
   .main { padding: 16px 16px 48px; }
 }
+
+/* Imports tab */
+.drop { display: flex; align-items: center; gap: 14px; padding: 18px; border: 2px dashed var(--line); border-radius: 14px; background: var(--card2); cursor: pointer; transition: border-color .15s, background .15s; }
+.drop:hover, .drop.over { border-color: var(--accent); background: var(--accentbg); }
+.drop.has { border-style: solid; border-color: var(--accent); background: var(--accentbg); }
+.drop input[type="file"] { display: none; }
+.drop .ico { width: 42px; height: 42px; border-radius: 12px; background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; display: grid; place-items: center; font-size: 20px; flex: none; }
+.drop .t { font-weight: 600; } .drop .s { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.drop .clear { margin-left: auto; }
+.field { width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--ink); font: inherit; }
+.field:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.field.sm { padding: 6px 8px; border-radius: 8px; font-size: 13px; } .field.num { text-align: right; }
+.imp-steps { display: grid; gap: 14px; }
+.imp-row td { cursor: default; } tbody tr.imp-row:hover td { background: transparent; }
+.fx { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

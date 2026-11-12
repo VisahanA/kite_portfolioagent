@@ -21,8 +21,12 @@ export type ScreenResult = {
 export type Report = {
   generated_at: string;
   market: { id: string; technicals: Technicals; caution: boolean };
-  holdings_by_value: { id: string; qty: number; avg: number; ltp: number; value: number; cost: number }[];
+  holdings_by_value: { id: string; qty: number; avg: number; ltp: number; value: number; cost: number; imported?: boolean }[];
   holdings_total_value: number; holdings_total_cost: number; results: ScreenResult[];
+  /** Zerodha-only totals (before imports are merged in). Present on merged reports. */
+  kite_total_value?: number; kite_total_cost?: number;
+  /** Each imported holding valued the same way as the merged totals (live Kite price where known), in INR. */
+  ext_lines?: { broker: string; symbol: string; value: number; cost: number; live: boolean }[];
 };
 
 export type Headline = { title: string; source: string; link: string; published: string };

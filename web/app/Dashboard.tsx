@@ -1,14 +1,17 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Analysis, Report, ScreenResult } from "../lib/types";
 import { planAll, type ExitPlan } from "../lib/exit";
-import { pickEntries, planHoldingBuys, type EntryPlan } from "../lib/entry";
+import { planHoldingBuys, type EntryPlan } from "../lib/entry";
 import { CAT, Donut, HBars, RangeBar, Scatter, Stacked, type Slice } from "./charts";
+import Imports from "./Imports";
+import { BROKERS, type ExtHolding } from "../lib/brokers";
 
 const inr = (n: number) => (n < 0 ? "-" : "") + "₹" + Math.abs(Math.round(n)).toLocaleString("en-IN");
 const inrk = (n: number) => { const a = Math.abs(n), s = n < 0 ? "-" : ""; return a >= 1e5 ? `${s}₹${(a / 1e5).toFixed(2)}L` : `${s}₹${(a / 1e3).toFixed(1)}k`; };
 const pct = (n: number) => (n >= 0 ? "+" : "") + n.toFixed(1) + "%";
+const stripCands = (r: Report): Report => ({ ...r, results: r.results.filter((x) => x.sources.includes("holding")) });
 const sym = (id: string) => id.split(":").pop()!;
 const stanceClass = (s: string) => (s === "Aligned positive" ? "good" : s === "Aligned cautious" ? "bad" : s.startsWith("Conflicting") ? "warn" : "");
 const sigClass = (s: string) => (s === "ENTRY ZONE" ? "good" : s === "FAILS RULES" ? "bad" : s === "WAIT FOR ENTRY" || s === "TECHNICAL ONLY" ? "warn" : "");
@@ -16,10 +19,10 @@ const stanceColor = (s: string) => (s === "Aligned positive" ? "var(--pos)" : s 
 const trendColor: Record<string, string> = { Uptrend: "var(--pos)", Recovering: "var(--c1)", Weakening: "var(--warn)", Downtrend: "var(--neg)" };
 
 type Row = { r: ScreenResult; id: string; s: string; qty: number; ltp: number; value: number; cost: number; w: number; pnlAbs: number; pnlPct: number; sector: string; color: string };
-type View = "overview" | "holdings" | "exit" | "entry" | "analytics";
+type View = "overview" | "holdings" | "exit" | "entry" | "analytics" | "imports";
 type SortKey = "value" | "pnlPct" | "rsi" | "quant" | "news";
 
-export default function Dashboard({ report: initial, candidates, file: initialFile, rules, claude }: { report: Report; candidates: ScreenResult[]; file: string; rules: Record<string, unknown>; claude: boolean }) {
+export default function Dashboard({ report: initial, candidates, file: initialFile, rules, claude, external }: { report: Report; candidates: ScreenResult[]; file: string; rules: Record<string, unknown>; claude: boolean; external: ExtHolding[] }) {
   const [report, setReport] = useState<Report>(initial);
   const [file, setFile] = useState(initialFile);
   const [kite, setKite] = useState<{ authUrl?: string; note?: string } | null>(null);
@@ -38,25 +41,41 @@ export default function Dashboard({ report: initial, candidates, file: initialFi
   const [rulesObj, setRulesObj] = useState(rules);
   const [rulesMsg, setRulesMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
+  const [ext, setExt] = useState<ExtHolding[]>(external);
+  const [fx, setFx] = useState(88);
+  useEffect(() => { try { const n = Number(localStorage.getItem("pa_usdinr")); if (n) setFx(n); } catch { /* optional */ } }, []);
+  const setFxSaved = (n: number) => { setFx(n); try { localStorage.setItem("pa_usdinr", String(n)); } catch { /* optional */ } };
+
+  // The report already includes imported holdings (merged server-side); quant/news only appear after Run agents.
   const rows: Row[] = useMemo(() => {
     const val = new Map(report.holdings_by_value.map((h) => [h.id, h]));
     return report.results
       .filter((r) => val.has(r.id))
       .map((r) => {
         const h = val.get(r.id)!;
-        return { r, id: r.id, s: sym(r.id), qty: h.qty, ltp: h.ltp, value: h.value, cost: h.cost, w: (h.value / report.holdings_total_value) * 100, pnlAbs: h.value - h.cost, pnlPct: ((h.value - h.cost) / h.cost) * 100, sector: r.fundamentals?.sector ?? "Unclassified", color: "" };
+        return { r, id: r.id, s: sym(r.id), qty: h.qty, ltp: h.ltp, value: h.value, cost: h.cost, w: (h.value / report.holdings_total_value) * 100, pnlAbs: h.value - h.cost, pnlPct: h.cost > 0 ? ((h.value - h.cost) / h.cost) * 100 : 0, sector: r.fundamentals?.sector ?? "Unclassified", color: "" };
       })
       .sort((a, b) => b.value - a.value)
       .map((x, i) => ({ ...x, color: CAT[i % 8] }));
   }, [report]);
+  const kiteRows = rows;
+
+  // Re-price imported USD holdings when the rate changes
+  useEffect(() => {
+    if (fx === 88 && ext.every((h) => h.currency !== "USD")) return;
+    fetch(`/api/external?fx=${fx}`).then((r) => r.json()).then((d) => { if (d.report) setReport(stripCands(d.report)); }).catch(() => {});
+  }, [fx]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const plans = useMemo(() => planAll(report, rulesObj), [report, rulesObj]);
-  const picks = useMemo(() => pickEntries(candidates, new Set(report.holdings_by_value.map((h) => h.id)), report.market.caution, rulesObj), [candidates, report, rulesObj]);
   const holdBuys = useMemo(() => planHoldingBuys(report, report.market.caution, rulesObj), [report, rulesObj]);
   const planOf = (id: string): ExitPlan | undefined => plans.find((p) => p.id === id);
+  // Zerodha-only totals come from the server (imports merged into a Kite line must not count as Kite money).
+  const kiteTotal = report.kite_total_value ?? report.holdings_total_value;
+  const kiteCost = report.kite_total_cost ?? report.holdings_total_cost;
   const total = report.holdings_total_value;
-  const pnl = total - report.holdings_total_cost;
-  const pnlPct = (pnl / report.holdings_total_cost) * 100;
+  const totalCost = report.holdings_total_cost;
+  const pnl = total - totalCost;
+  const pnlPct = totalCost > 0 ? (pnl / totalCost) * 100 : 0;
   const m = report.market.technicals;
   const ran = Object.keys(analyses).length > 0;
   const byPnl = [...rows].sort((a, b) => b.pnlPct - a.pnlPct);
@@ -78,9 +97,9 @@ export default function Dashboard({ report: initial, candidates, file: initialFi
   async function run() {
     setRunning(true); setDone(0); setErr(null); setBrief(null); setKite(null);
     // 1. Pull live holdings from the Kite MCP server
-    let runRows = rows;
+    let runRows = kiteRows;
     try {
-      const res = await fetch("/api/kite/refresh", { method: "POST" });
+      const res = await fetch(`/api/kite/refresh?fx=${fx}`, { method: "POST" });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? res.statusText);
       if (data.status === "auth") {
@@ -90,17 +109,17 @@ export default function Dashboard({ report: initial, candidates, file: initialFi
         return;
       }
       const fresh: Report = { ...data.report, results: data.report.results.filter((r: ScreenResult) => r.sources.includes("holding")) };
-      setReport(fresh); setFile(data.file);
+      setReport(fresh); setFile(fresh.generated_at.slice(0, 10));
       const val = new Map(fresh.holdings_by_value.map((h) => [h.id, h]));
       runRows = fresh.results.filter((r) => val.has(r.id)).map((r) => ({ id: r.id, s: sym(r.id) } as Row));
-      setKite({ note: `Live holdings from Kite at ${new Date(data.fetchedAt).toLocaleTimeString()}${data.missing.length ? ` · not in screen: ${data.missing.join(", ")}` : ""}` });
+      setKite({ note: `Live holdings from Kite at ${new Date(data.fetchedAt).toLocaleTimeString()}${data.gaps.length ? ` · gaps: ${data.gaps.join("; ")}` : ""}` });
     } catch (e) {
-      setKite({ note: `Kite refresh failed, using saved holdings: ${(e as Error).message}` });
+      setKite({ note: `Kite refresh failed, showing last saved screen: ${(e as Error).message}` });
     }
     const out: Record<string, Analysis> = {};
     for (const row of runRows) {
       try {
-        const res = await fetch(`/api/analyze?id=${encodeURIComponent(row.id)}`);
+        const res = await fetch(`/api/analyze?id=${encodeURIComponent(row.id)}&fx=${fx}`);
         const text = await res.text();
         let data: unknown;
         try { data = JSON.parse(text); } catch { throw new Error(`Server returned non-JSON (HTTP ${res.status}). Check the dev server console.`); }
@@ -149,12 +168,12 @@ export default function Dashboard({ report: initial, candidates, file: initialFi
   const top = rows.slice(0, 7);
   const rest = rows.slice(7);
   const donut: Slice[] = [...top.map((x) => ({ label: x.s, value: x.value, color: x.color })), ...(rest.length ? [{ label: `Other (${rest.length})`, value: rest.reduce((a, b) => a + b.value, 0), color: "var(--cx)" }] : [])];
-  const sectors = Object.entries(rows.reduce<Record<string, number>>((a, x) => ((a[x.sector] = (a[x.sector] ?? 0) + x.w), a), {})).sort((a, b) => b[1] - a[1]);
-  const trendCounts = ["Uptrend", "Recovering", "Weakening", "Downtrend"].map((t) => ({ label: t, value: rows.filter((x) => x.r.technicals?.trend === t).length, color: trendColor[t] }))
-    .concat([{ label: "No data", value: rows.filter((x) => !x.r.technicals).length, color: "var(--cx)" }]);
-  const sigs = Array.from(new Set(rows.map((x) => x.r.signal)));
-  const sigCounts = sigs.map((s) => ({ label: s, value: rows.filter((x) => x.r.signal === s).length, color: s === "ENTRY ZONE" ? "var(--pos)" : s === "FAILS RULES" ? "var(--neg)" : s === "WAIT FOR ENTRY" ? "var(--c4)" : s === "TECHNICAL ONLY" ? "var(--c1)" : "var(--cx)" }));
-  const attention = rows.filter((x) => x.r.technicals?.trend === "Downtrend" || x.r.signal === "FAILS RULES").sort((a, b) => b.value - a.value).slice(0, 5);
+  const sectors = Object.entries(kiteRows.reduce<Record<string, number>>((a, x) => ((a[x.sector] = (a[x.sector] ?? 0) + x.w), a), {})).sort((a, b) => b[1] - a[1]);
+  const trendCounts = ["Uptrend", "Recovering", "Weakening", "Downtrend"].map((t) => ({ label: t, value: kiteRows.filter((x) => x.r.technicals?.trend === t).length, color: trendColor[t] }))
+    .concat([{ label: "No data", value: kiteRows.filter((x) => !x.r.technicals).length, color: "var(--cx)" }]);
+  const sigs = Array.from(new Set(kiteRows.map((x) => x.r.signal)));
+  const sigCounts = sigs.map((s) => ({ label: s, value: kiteRows.filter((x) => x.r.signal === s).length, color: s === "ENTRY ZONE" ? "var(--pos)" : s === "FAILS RULES" ? "var(--neg)" : s === "WAIT FOR ENTRY" ? "var(--c4)" : s === "TECHNICAL ONLY" ? "var(--c1)" : "var(--cx)" }));
+  const attention = kiteRows.filter((x) => x.r.technicals?.trend === "Downtrend" || x.r.signal === "FAILS RULES").sort((a, b) => b.value - a.value).slice(0, 5);
   const sel_ = sel ? rows.find((x) => x.id === sel) : null;
   const selA = sel ? analyses[sel] : null;
 
@@ -171,23 +190,25 @@ export default function Dashboard({ report: initial, candidates, file: initialFi
         <NavBtn v="exit" icon="↗" label="Exit plan" />
         <NavBtn v="entry" icon="↘" label="Entry plan" />
         <NavBtn v="analytics" icon="◔" label="Analytics" />
+        <NavBtn v="imports" icon="⇪" label="Imports" />
         <div className="grow" />
         <button className="nav" onClick={toggleTheme}><span>◐</span>Toggle theme</button>
-        <div className="sidefoot">Screen {file.replace("screen-", "").replace(".json", "")}<br />Candles to {m.last_candle}<br />{claude ? "Claude sentiment on" : "Lexicon sentiment"}</div>
+        <div className="sidefoot">Screen {file.replace("screen-", "").replace(".json", "")}<br />Candles to {m.last_candle ?? "n/a"}<br />{claude ? "Claude sentiment on" : "Lexicon sentiment"}</div>
       </aside>
 
       <main className="main">
         <div className="head">
           <div>
-            <h1>{view === "overview" ? "Overview" : view === "holdings" ? "Holdings" : view === "exit" ? "Exit plan" : view === "entry" ? "Entry plan" : "Analytics"}</h1>
+            <h1>{view === "overview" ? "Overview" : view === "holdings" ? "Holdings" : view === "exit" ? "Exit plan" : view === "entry" ? "Entry plan" : view === "imports" ? "Imports" : "Analytics"}</h1>
             <div className="muted sm">{rows.length} holdings · quant signals + news sentiment · read-only</div>
           </div>
           <div className="actions">
             <div>
-              <button className="btn primary" disabled={running} onClick={run}>{running ? `Running agents ${done}/${rows.length}…` : ran ? "↻ Re-run agents" : "▶ Run agents"}</button>
-              {running && <div className="bar"><i style={{ width: `${(done / rows.length) * 100}%` }} /></div>}
+              <button className="btn primary" disabled={running} onClick={run}>{running ? `Running agents ${done}/${kiteRows.length}…` : ran ? "↻ Re-run agents" : "▶ Run agents"}</button>
+              {running && <div className="bar"><i style={{ width: `${(done / Math.max(1, kiteRows.length)) * 100}%` }} /></div>}
               {kite?.authUrl && <div className="muted sm">Kite login needed: <a href={kite.authUrl} target="_blank" rel="noreferrer">authorize here</a>, then click Run agents again.</div>}
               {kite?.note && <div className="muted sm">{kite.note}</div>}
+              <div className="muted sm"><a href="#" onClick={async (e) => { e.preventDefault(); await fetch("/api/kite/logout", { method: "POST" }); window.location.href = "/"; }}>Switch Kite account</a></div>
               {mail?.authUrl && <div className="muted sm">Gmail login needed: <a href={mail.authUrl} target="_blank" rel="noreferrer">authorize here</a>, then click Run agents again.</div>}
               {mail?.note && <div className="muted sm">{mail.note}</div>}
             </div>
@@ -203,7 +224,7 @@ export default function Dashboard({ report: initial, candidates, file: initialFi
               <div className="big num">{inr(total)}</div>
               <span className="pill">{pnl >= 0 ? "▲" : "▼"} {inr(pnl)} · {pct(pnlPct)} vs cost</span>
             </div>
-            <div className="card kpi"><div className="lbl">Invested</div><div className="v num">{inr(report.holdings_total_cost)}</div><div className="d">{rows.length} positions</div></div>
+            <div className="card kpi"><div className="lbl">Invested</div><div className="v num">{inr(totalCost)}</div><div className="d">{rows.length} positions</div></div>
             <div className="card kpi"><div className="lbl">Best / worst</div><div className="v"><span className="pos">{byPnl[0].s}</span> <span className="muted">/</span> <span className="neg">{byPnl.at(-1)!.s}</span></div><div className="d">{pct(byPnl[0].pnlPct)} / {pct(byPnl.at(-1)!.pnlPct)}</div></div>
             <div className="card kpi"><div className="lbl">Quant vs news conflicts</div><div className="v">{ran ? conflicts.length : "–"}</div><div className="d">{ran ? conflicts.map((c) => c.symbol).join(", ") || "none" : "run agents to check"}</div></div>
           </div>
@@ -284,7 +305,7 @@ export default function Dashboard({ report: initial, candidates, file: initialFi
             <div className="grid g4">
               <div className="card kpi"><div className="lbl">Sell / trim now</div><div className="v">{trims.length}</div><div className="d">{trims.filter((p) => p.action === "Exit").length} full exits · {inrk(proceeds)} proceeds</div></div>
               <div className="card kpi"><div className="lbl">Realised P&amp;L if done</div><div className={"v num " + (realised >= 0 ? "pos" : "neg")}>{inr(realised)}</div><div className="d">vs your average cost, before tax</div></div>
-              <div className="card kpi"><div className="lbl">Worst case at stops</div><div className="v num neg">{inr(-downside)}</div><div className="d">{pct((-downside / total) * 100)} of portfolio, on shares kept</div></div>
+              <div className="card kpi"><div className="lbl">Worst case at stops</div><div className="v num neg">{inr(-downside)}</div><div className="d">{pct((-downside / kiteTotal) * 100)} of portfolio, on shares kept</div></div>
               <div className="card kpi"><div className="lbl">Profit ladder</div><div className="v num">{inrk(ladder)}</div><div className="d">if every target fills</div></div>
             </div>
             <div className="card">
@@ -311,40 +332,14 @@ export default function Dashboard({ report: initial, candidates, file: initialFi
         })()}
 
         {view === "entry" && (() => {
-          const all = [...picks.large, ...picks.mid];
+          const all = holdBuys;
           const now = all.filter((p) => p.status === "Enter now").length;
           const wait = all.filter((p) => p.status === "Wait for pullback").length;
           const stat = (p: EntryPlan) => (p.status === "Enter now" ? "good" : p.status === "Wait for pullback" ? "warn" : "bad");
-          const meta = (id: string) => candidates.find((c) => c.id === id)!;
-          const table = (title: string, list: EntryPlan[], scanned: number) => (
-            <div className="card">
-              <h2>{title}</h2>
-              <div className="sub">Top {list.length} of {scanned} scanned, ranked by fundamentals, trend and distance to the entry zone. Stocks you already hold are excluded; their add-on triggers are in the table above.</div>
-              {list.length === 0 ? <div className="empty">No candidates scanned for this tier yet. Run the kite-fundamental-analysis skill's candidate scan.</div> : (
-                <div className="tablewrap">
-                  <table>
-                    <thead><tr><th>Stock</th><th>Status</th><th className="n">Entry zone</th><th>Buy in steps</th><th className="n">Stop</th><th>Targets</th><th>Why</th></tr></thead>
-                    <tbody>
-                      {list.map((p) => { const c = meta(p.id), f = c.fundamentals, t = c.technicals; return (
-                        <tr key={p.id}>
-                          <td><div className="sym"><div><b>{sym(p.id)}</b><div className="sm muted">{f?.sector ?? "Unclassified"}{f?.market_cap_cr ? ` · ₹${Math.round(f.market_cap_cr / 1000).toLocaleString("en-IN")}k cr` : ""}</div><div className="sm muted">LTP {p.price.toLocaleString("en-IN")}{t ? ` · RSI ${t.rsi14} · ${t.trend}` : ""}</div></div></div></td>
-                          <td><span className={"pill " + stat(p)}>{p.status}</span><div className="sm muted">{p.signal}</div></td>
-                          <td className="n num">{p.zone ? <>{p.zone.low.toLocaleString("en-IN")} – {p.zone.high.toLocaleString("en-IN")}<div className="sm muted">{p.status === "Enter now" ? "price is in range" : `${p.away_pct}% below price`} · {p.zone.basis}</div></> : <span className="muted">–</span>}</td>
-                          <td className="num">{p.tranches.length ? p.tranches.map((x, i) => <div key={i} className="sm">{x.pct}% at {x.price.toLocaleString("en-IN")} <span className="muted">{x.why}</span></div>) : <span className="muted">–</span>}{p.avg_entry && <div className="sm muted">avg {p.avg_entry.toLocaleString("en-IN")}</div>}</td>
-                          <td className="n num">{p.stop ? <>{p.stop.price.toLocaleString("en-IN")}<div className="sm muted">-{p.stop.distance_pct}% · {p.stop.basis}</div></> : <span className="muted">–</span>}</td>
-                          <td className="num">{p.targets.length ? <>{p.targets.map((x) => <div key={x.price} className="sm">{x.price.toLocaleString("en-IN")} <span className="muted">+{x.gain_pct}%</span></div>)}{p.reward_risk != null && <div className="sm muted">reward/risk {p.reward_risk}</div>}</> : <span className="muted">–</span>}</td>
-                          <td className="sm">{p.reasons.map((x, i) => <div key={i}>{x}</div>)}{p.warnings.map((x, i) => <div key={"w" + i} className="muted">{x}</div>)}</td>
-                        </tr>); })}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          );
           return (<>
             <div className="grid g4">
-              <div className="card kpi"><div className="lbl">Candidates scanned</div><div className="v">{picks.scanned.large + picks.scanned.mid}</div><div className="d">{picks.scanned.large} large · {picks.scanned.mid} mid cap{picks.scanned.other ? ` · ${picks.scanned.other} other (not shown)` : ""}</div></div>
-              <div className="card kpi"><div className="lbl">In the entry zone now</div><div className="v">{now}</div><div className="d">of the {all.length} shown</div></div>
+              <div className="card kpi"><div className="lbl">Holdings tracked</div><div className="v">{all.length}</div><div className="d">add-on triggers below</div></div>
+              <div className="card kpi"><div className="lbl">In the entry zone now</div><div className="v">{now}</div><div className="d">of your {all.length} holdings</div></div>
               <div className="card kpi"><div className="lbl">Waiting for a pullback</div><div className="v">{wait}</div><div className="d">limit levels below</div></div>
               <div className="card kpi"><div className="lbl">Market</div><div className="v">{report.market.caution ? "Caution" : "Clear"}</div><div className="d">NIFTY {report.market.technicals.trend}, RSI {report.market.technicals.rsi14}</div></div>
             </div>
@@ -369,11 +364,11 @@ export default function Dashboard({ report: initial, candidates, file: initialFi
                 </table>
               </div>
             </div>
-            {table("Large cap", picks.large, picks.scanned.large)}
-            {table("Mid cap", picks.mid, picks.scanned.mid)}
             <div className="card"><div className="sub">How to read this: the entry zone is the nearest support below price (SMA20, SMA50 or SMA200) plus or minus your pullback band. "Buy in steps" splits the intended position across the zone so one price is never the whole bet. The stop and targets are measured from the average entry. Triggers use daily closes, so check after the close. Tune every number in the entry_plan and entry blocks of your rules.</div></div>
           </>);
         })()}
+
+        {view === "imports" && <Imports held={ext} onChange={(h, rep) => { setExt(h); if (rep) setReport(stripCands(rep)); }} fx={fx} setFx={setFxSaved} kiteValue={kiteTotal} kiteCost={kiteCost} totalValue={total} totalCost={totalCost} ext_lines={report.ext_lines} />}
 
         {view === "analytics" && (<>
           <div className="grid g2">
@@ -381,21 +376,21 @@ export default function Dashboard({ report: initial, candidates, file: initialFi
               <h2>Quant vs news</h2><div className="sub">Agreement between trend/fundamental score and headline sentiment</div>
               {ran ? (
                 <Scatter xDom={[-100, 100]} yDom={[-100, 100]} xMid={0} yMid={0} xLabel="Quant score" yLabel="News sentiment" quad={["Both positive", "News up, quant down", "Both cautious", "Quant up, news down"]}
-                  pts={rows.filter((x) => analyses[x.id]?.sentiment.method !== "none" && analyses[x.id]).map((x) => { const a = analyses[x.id]; return { label: x.s, x: a.quantScore, y: a.newsScore, r: 5 + x.w * 0.6, color: stanceColor(a.stance), tip: <><b>{x.s}</b><div>Quant {a.quantScore} · News {a.newsScore}</div><div>{a.stance}</div></> }; })} />
+                  pts={kiteRows.filter((x) => analyses[x.id]?.sentiment.method !== "none" && analyses[x.id]).map((x) => { const a = analyses[x.id]; return { label: x.s, x: a.quantScore, y: a.newsScore, r: 5 + x.w * 0.6, color: stanceColor(a.stance), tip: <><b>{x.s}</b><div>Quant {a.quantScore} · News {a.newsScore}</div><div>{a.stance}</div></> }; })} />
               ) : <div className="empty">Run the agents to plot quant against news.</div>}
               {ran && <div className="legend"><span><i style={{ background: "var(--pos)" }} />Aligned positive</span><span><i style={{ background: "var(--neg)" }} />Aligned cautious</span><span><i style={{ background: "var(--warn)" }} />Conflicting</span><span><i style={{ background: "var(--cx)" }} />Neutral</span></div>}
             </div>
             <div className="card">
               <h2>Quality vs valuation</h2><div className="sub">P/E against ROE; bubble size is portfolio weight. Dashed lines are your limits.</div>
               <Scatter xDom={[0, 80]} yDom={[0, 60]} xMid={maxPe} yMid={minRoe} xLabel="P/E (capped at 80)" yLabel="ROE %" quad={["Pricey, high quality", "Cheap, high quality", "Cheap, low quality", "Pricey, low quality"]}
-                pts={rows.filter((x) => x.r.fundamentals?.pe != null && x.r.fundamentals?.roe != null).map((x) => ({ label: x.s, x: Math.min(80, Math.max(0, x.r.fundamentals!.pe!)), y: Math.min(60, Math.max(0, x.r.fundamentals!.roe!)), r: 5 + x.w * 0.8, color: x.color, tip: <><b>{x.s}</b><div>P/E {x.r.fundamentals!.pe} · ROE {x.r.fundamentals!.roe}%</div><div>{x.w.toFixed(1)}% of portfolio</div></> }))} />
+                pts={kiteRows.filter((x) => x.r.fundamentals?.pe != null && x.r.fundamentals?.roe != null).map((x) => ({ label: x.s, x: Math.min(80, Math.max(0, x.r.fundamentals!.pe!)), y: Math.min(60, Math.max(0, x.r.fundamentals!.roe!)), r: 5 + x.w * 0.8, color: x.color, tip: <><b>{x.s}</b><div>P/E {x.r.fundamentals!.pe} · ROE {x.r.fundamentals!.roe}%</div><div>{x.w.toFixed(1)}% of portfolio</div></> }))} />
             </div>
           </div>
 
           <div className="grid g2">
             <div className="card"><h2>Sector exposure</h2><div className="sub">Share of portfolio value</div><HBars data={sectors.slice(0, 8).map(([k, v]) => ({ label: k, value: v }))} fmt={(n) => n.toFixed(1) + "%"} /></div>
             <div className="card"><h2>Momentum (RSI-14)</h2><div className="sub">Overbought above 70, oversold below 30</div>
-              <HBars data={rows.filter((x) => x.r.technicals).sort((a, b) => b.r.technicals!.rsi14 - a.r.technicals!.rsi14).map((x) => ({ label: x.s, value: x.r.technicals!.rsi14, color: x.r.technicals!.rsi14 > 70 ? "var(--warn)" : x.r.technicals!.rsi14 < 30 ? "var(--c1)" : "var(--accent)" }))} fmt={(n) => n.toFixed(0)} />
+              <HBars data={kiteRows.filter((x) => x.r.technicals).sort((a, b) => b.r.technicals!.rsi14 - a.r.technicals!.rsi14).map((x) => ({ label: x.s, value: x.r.technicals!.rsi14, color: x.r.technicals!.rsi14 > 70 ? "var(--warn)" : x.r.technicals!.rsi14 < 30 ? "var(--c1)" : "var(--accent)" }))} fmt={(n) => n.toFixed(0)} />
             </div>
           </div>
 
