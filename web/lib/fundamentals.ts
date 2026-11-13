@@ -1,22 +1,19 @@
-import fs from "node:fs";
-import path from "node:path";
-import { dataDir } from "./data";
+import { httpGet } from "./http";
+import { daysSince, r2 } from "./num";
+import { dataFile, readJson, writeJson } from "./store";
 import type { Fundamentals } from "./types";
 
 // Fundamentals come only from the public screener.in company page (it has no official API). Results are cached
 // per trading symbol in data/fundamentals.json; that file is shared by all users because it is public market data.
-const file = () => path.join(dataDir(), "data", "fundamentals.json");
-const readAll = (): Record<string, Fundamentals> => { try { return JSON.parse(fs.readFileSync(file(), "utf8")); } catch { return {}; } };
-function save(sym: string, f: Fundamentals) {
-  try { fs.mkdirSync(path.dirname(file()), { recursive: true }); const all = readAll(); all[sym] = f; fs.writeFileSync(file(), JSON.stringify(all, null, 2)); } catch { /* read-only deploy: the cache is optional */ }
-}
+const file = () => dataFile("fundamentals.json");
+const readAll = () => readJson<Record<string, Fundamentals>>(file()) ?? {};
+const save = (sym: string, f: Fundamentals) => writeJson(file(), { ...readAll(), [sym]: f }, { pretty: true, optional: true }); // read-only deploy: the cache is optional
 
-const UA = { "user-agent": "Mozilla/5.0 (portfolio-screen)" };
 const num = (s: string | undefined | null) => { if (!s) return null; const n = parseFloat(s.replace(/,/g, "")); return Number.isFinite(n) ? n : null; };
 const strip = (h: string) => h.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/\s+/g, " ").trim();
 
 async function page(url: string): Promise<string | null> {
-  const res = await fetch(url, { headers: UA, signal: AbortSignal.timeout(15000), redirect: "follow" });
+  const res = await httpGet(url, { redirect: "follow" });
   return res.ok ? await res.text() : null;
 }
 
@@ -28,7 +25,7 @@ async function findHtml(symbol: string): Promise<{ html: string; url: string } |
   }
   // Some listings (e.g. BSE-only) sit under another id: use screener's own search to find the page.
   try {
-    const res = await fetch(`https://www.screener.in/api/company/search/?q=${s}`, { headers: UA, signal: AbortSignal.timeout(10000) });
+    const res = await httpGet(`https://www.screener.in/api/company/search/?q=${s}`, { timeoutMs: 10000 });
     const hit = ((await res.json()) as { url?: string }[])?.[0]?.url;
     if (hit) {
       const u = `https://www.screener.in${hit}`;
@@ -66,9 +63,9 @@ function parse(html: string, url: string, price: number): Fundamentals {
   return {
     as_of: new Date().toISOString().slice(0, 10), source: url, sector: industry || sector || "Unclassified",
     is_financial: /bank|financ|insurance|nbfc|capital markets/i.test(`${sector} ${industry}`),
-    pe: num(top["Stock P/E"]), pb: bv && price ? Math.round((price / bv) * 100) / 100 : null,
+    pe: num(top["Stock P/E"]), pb: bv && price ? r2(price / bv) : null,
     roe: num(top["ROE"]), roce: num(top["ROCE"]),
-    debt_to_equity: borrow != null && eq != null && res != null && eq + res > 0 ? Math.round((borrow / (eq + res)) * 100) / 100 : null,
+    debt_to_equity: borrow != null && eq != null && res != null && eq + res > 0 ? r2(borrow / (eq + res)) : null,
     sales_growth_3y: growth("Compounded Sales Growth"), profit_growth_3y: growth("Compounded Profit Growth"),
     dividend_yield: num(top["Dividend Yield"]), market_cap_cr: num(top["Market Cap"]),
     notes: "From the screener.in public company page.",
@@ -78,7 +75,7 @@ function parse(html: string, url: string, price: number): Fundamentals {
 /** Cached fundamentals if fresh enough, otherwise fetched from screener.in. Null when the site has nothing (shows as NO FUNDAMENTALS). */
 export async function getFundamentals(symbol: string, price: number, maxAgeDays: number): Promise<Fundamentals | null> {
   const cached = readAll()[symbol];
-  if (cached && (Date.now() - new Date(cached.as_of).getTime()) / 864e5 <= maxAgeDays) return cached;
+  if (cached && daysSince(cached.as_of) <= maxAgeDays) return cached;
   try {
     const found = await findHtml(symbol);
     if (!found) return cached ?? null;

@@ -1,22 +1,24 @@
-import fs from "node:fs";
-import path from "node:path";
-import { dataDir } from "./data";
-import { hasClaude, llm } from "./llm";
+import { hasClaude, llmJson } from "./llm";
+import { dataFile, readJson, writeJson } from "./store";
 
 // Maps any spelling a broker uses ("BHARTI AIRTEL LTD", "BHARTIARTL-EQ", "Bharti Artl") to ONE official NSE trading symbol.
 // Public market knowledge, so the alias table is shared by all users: data/symbol-aliases.json
-const file = () => path.join(dataDir(), "data", "symbol-aliases.json");
+const file = () => dataFile("symbol-aliases.json");
 type Aliases = Record<string, string>;
 
-const readAll = (): Aliases => { try { return JSON.parse(fs.readFileSync(file(), "utf8")); } catch { return {}; } };
-const save = (a: Aliases) => { try { fs.mkdirSync(path.dirname(file()), { recursive: true }); fs.writeFileSync(file(), JSON.stringify(a, null, 2)); } catch { /* read-only deploy: optional */ } };
+const readAll = () => readJson<Aliases>(file()) ?? {};
+const save = (a: Aliases) => writeJson(file(), a, { pretty: true, optional: true }); // read-only deploy: optional
 
-/** Strip exchange/series decorations and punctuation: "NSE:Reliance Industries Ltd-EQ" -> "RELIANCEINDUSTRIES". */
+/** Drop the exchange prefix/suffix (NSE:, .NS, .BO) and the series suffix (-EQ, -BE, -BZ, -T...). */
+const stripListing = (s: string) =>
+  s.toUpperCase().trim().replace(/^(NSE|BSE)[:\s]+/, "").replace(/\.(NS|NSE|BO|BSE)$/, "").replace(/-(EQ|BE|BZ|BL|SM|ST|T|N\d)$/, "");
+
+/** Trading-symbol form of a broker's symbol, hyphens kept: "NSE:BAJAJ-AUTO-EQ" -> "BAJAJ-AUTO". */
+export const tickerOf = (s: string) => stripListing(s).replace(/[^A-Z0-9&-]/g, "");
+
+/** Matching key that also drops company words and punctuation: "NSE:Reliance Industries Ltd-EQ" -> "RELIANCEINDUSTRIES". */
 export const key = (s: string) =>
-  s.toUpperCase().trim()
-    .replace(/^(NSE|BSE)[:\s]+/, "").replace(/\.(NS|NSE|BO|BSE)$/, "").replace(/-(EQ|BE|BZ|BL|SM|ST|T|N\d)$/, "")
-    .replace(/\b(LIMITED|LTD|CORPORATION|CORP|INDIA|CO|THE)\b\.?/g, " ")
-    .replace(/[^A-Z0-9&]/g, "");
+  stripListing(s).replace(/\b(LIMITED|LTD|CORPORATION|CORP|INDIA|CO|THE)\b\.?/g, " ").replace(/[^A-Z0-9&]/g, "");
 
 const lev = (a: string, b: string) => {
   const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
@@ -57,12 +59,11 @@ export async function resolveAliases(raws: { symbol: string; name?: string }[], 
   let changed = false;
   if (hasClaude()) {
     try {
-      const out = await llm(
+      const j = await llmJson<Record<string, string | null>>(
         "You normalise Indian stock names to the official NSE trading symbol (as in NSE's equity list, e.g. BHARTIARTL, HDFCBANK, M&M, BAJAJ-AUTO). Several spellings, typos or company names can map to one symbol. Reply with JSON only.",
         `Already-known symbols (prefer these if the input is the same company): ${[...new Set(known)].join(", ") || "none"}\n\nInputs (key => text):\n${[...todo].map(([k, t]) => `${k} => ${t}`).join("\n")}\n\nReturn {"<key>": "<NSE SYMBOL or null if unsure / not an NSE stock>"} for every key.`,
         1500,
       );
-      const j = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1)) as Record<string, string | null>;
       for (const [k] of todo) {
         const v = j[k];
         if (typeof v === "string" && /^[A-Z0-9&-]{1,20}$/.test(v.toUpperCase())) { aliases[k] = v.toUpperCase(); changed = true; }

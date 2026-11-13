@@ -1,14 +1,15 @@
+import { httpGet } from "./http";
 import type { Candle } from "./market";
+import { daysSince, r2 } from "./num";
 import type { Fundamentals } from "./types";
 
 // US stocks: daily candles and fundamentals from Yahoo Finance's public endpoints (no key). Output has the same
 // shape as the Indian path (Candle[] -> technicals(), Fundamentals), so the same rules and quant score apply.
-const UA = { "user-agent": "Mozilla/5.0 (portfolio-screen)", accept: "application/json" };
+const JSON_ACCEPT = { accept: "application/json" };
 const num = (v: unknown): number | null => { const n = typeof v === "object" && v && "raw" in v ? (v as { raw: unknown }).raw : v; return typeof n === "number" && Number.isFinite(n) ? n : null; };
-const r2 = (n: number) => Math.round(n * 100) / 100;
 
 async function getJson(url: string, headers: Record<string, string> = {}): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
-  const res = await fetch(url, { headers: { ...UA, ...headers }, signal: AbortSignal.timeout(15000) });
+  const res = await httpGet(url, { headers: { ...JSON_ACCEPT, ...headers } });
   if (!res.ok) throw new Error(`Yahoo ${res.status}`);
   return res.json();
 }
@@ -44,9 +45,9 @@ export async function fetchUsCandles(ticker: string): Promise<{ candles: Candle[
 let auth: { cookie: string; crumb: string; at: number } | null = null;
 async function getAuth() {
   if (auth && Date.now() - auth.at < 30 * 60e3) return auth;
-  const r = await fetch("https://fc.yahoo.com", { headers: UA, redirect: "manual", signal: AbortSignal.timeout(10000) });
+  const r = await httpGet("https://fc.yahoo.com", { headers: JSON_ACCEPT, redirect: "manual", timeoutMs: 10000 });
   const cookie = (r.headers.getSetCookie?.() ?? []).map((c) => c.split(";")[0]).join("; ");
-  const crumb = await (await fetch("https://query1.finance.yahoo.com/v1/test/getcrumb", { headers: { ...UA, cookie }, signal: AbortSignal.timeout(10000) })).text();
+  const crumb = await (await httpGet("https://query1.finance.yahoo.com/v1/test/getcrumb", { headers: { ...JSON_ACCEPT, cookie }, timeoutMs: 10000 })).text();
   if (!crumb || /<|Too Many/.test(crumb)) throw new Error("Yahoo crumb unavailable");
   return (auth = { cookie, crumb, at: Date.now() });
 }
@@ -68,7 +69,13 @@ async function series(ticker: string, types: string[]): Promise<Record<string, n
 }
 const cagr3 = (a?: number[]) => (a && a.length >= 4 && a.at(-4)! > 0 && a.at(-1)! > 0 ? r2((Math.pow(a.at(-1)! / a.at(-4)!, 1 / 3) - 1) * 100) : null);
 
-export async function fetchUsFundamentals(ticker: string, price: number): Promise<Fundamentals | null> {
+/** Cached fundamentals while younger than `maxAgeDays`, otherwise a fresh fetch (falling back to the cached copy). */
+export async function usFundamentals(ticker: string, price: number, cached: Fundamentals | null, maxAgeDays: number): Promise<Fundamentals | null> {
+  if (cached && daysSince(cached.as_of) <= maxAgeDays) return cached;
+  return (await fetchUsFundamentals(ticker, price).catch(() => null)) ?? cached;
+}
+
+async function fetchUsFundamentals(ticker: string, price: number): Promise<Fundamentals | null> {
   let sum: Record<string, any> = {}; // eslint-disable-line @typescript-eslint/no-explicit-any
   try {
     const a = await getAuth();

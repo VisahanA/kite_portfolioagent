@@ -1,7 +1,6 @@
-import { hasApiKey, llm } from "./llm";
+import { hasApiKey, llmJson } from "./llm";
+import { clamp } from "./num";
 import type { Headline, Sentiment } from "./types";
-
-export { hasClaude, model } from "./llm";
 
 const POS = ["surge", "rally", "gain", "beat", "record", "profit", "growth", "upgrade", "win", "order", "expansion", "strong", "rise", "jumps", "soars", "approval", "dividend", "outperform", "bullish"];
 const NEG = ["fall", "drop", "plunge", "miss", "loss", "downgrade", "probe", "fraud", "penalty", "fine", "weak", "slump", "cut", "decline", "lawsuit", "resign", "concern", "bearish", "tumbles", "crash", "ban", "default"];
@@ -11,7 +10,7 @@ function lexiconScore(t: string) {
   let s = 0;
   for (const p of POS) if (w.includes(p)) s++;
   for (const n of NEG) if (w.includes(n)) s--;
-  return Math.max(-1, Math.min(1, s / 2));
+  return clamp(s / 2, -1, 1);
 }
 
 function label(score: number): Sentiment["label"] {
@@ -25,16 +24,15 @@ export async function scoreSentiment(symbol: string, sector: string, items: Head
   if (hasApiKey()) { // model sentiment only via the fast direct API; otherwise the lexicon below
     try {
       const list = items.map((h, i) => `${i}. ${h.title} (${h.source}, ${h.published.slice(0, 10)})`).join("\n");
-      const text = await llm(
+      const j = await llmJson<{ scores?: unknown[]; overall?: unknown; confidence?: unknown; themes?: string[]; rationale?: unknown }>(
         "You are a financial news sentiment analyst for Indian equities. Judge only what the headlines say about the company's business prospects and stock. Reply with JSON only.",
         `Company symbol: ${symbol} (${sector}).\nHeadlines:\n${list}\n\nReturn JSON: {"scores":[number -1..1 per headline, in order, 0 if irrelevant to this company],"overall":number -1..1,"confidence":number 0..1 (low if few/irrelevant/old headlines),"themes":[up to 4 short strings],"rationale":"max 2 sentences"}`,
         1200,
       );
-      const j = JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
-      const overall = Math.max(-1, Math.min(1, Number(j.overall) || 0));
+      const overall = clamp(Number(j.overall) || 0, -1, 1);
       return {
         score: overall,
-        confidence: Math.max(0, Math.min(1, Number(j.confidence) || 0.5)),
+        confidence: clamp(Number(j.confidence) || 0.5, 0, 1),
         label: label(overall),
         themes: (j.themes ?? []).slice(0, 4),
         rationale: String(j.rationale ?? ""),

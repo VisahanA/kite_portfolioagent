@@ -1,4 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
+import { httpGet } from "./http";
 import type { Headline } from "./types";
 
 // Company names make the news query precise (bare tickers like BSE / ITC are ambiguous).
@@ -18,7 +19,7 @@ export async function fetchNews(symbol: string, limit = 12): Promise<Headline[]>
   // Only the company name goes out in the query; no quantities or portfolio data.
   const q = `${NAMES[symbol] ?? symbol} share stock when:14d`;
   const url = `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-IN&gl=IN&ceid=IN:en`;
-  const res = await fetch(url, { headers: { "user-agent": "Mozilla/5.0 (portfolio-screen)" }, signal: AbortSignal.timeout(12000) });
+  const res = await httpGet(url, { timeoutMs: 12000 });
   if (!res.ok) throw new Error(`news feed ${res.status}`);
   const xml = new XMLParser({ ignoreAttributes: false }).parse(await res.text());
   const raw = xml?.rss?.channel?.item ?? [];

@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { apiJson } from "./client";
 
 /** First screen for a visitor with no saved report: connect their own Kite account, then screen whatever they hold. */
 export default function Landing() {
@@ -14,10 +15,8 @@ export default function Landing() {
   async function connect() {
     setBusy(true); setMsg(null);
     try {
-      const res = await fetch("/api/kite/refresh", { method: "POST" });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? res.statusText);
-      if (data.status === "auth") { setAuthUrl(data.authUrl); window.location.href = data.authUrl; return; }
+      const data = await apiJson<{ status: string; authUrl?: string }>("/api/kite/refresh", { method: "POST" });
+      if (data.status === "auth" && data.authUrl) { setAuthUrl(data.authUrl); window.location.href = data.authUrl; return; }
       router.refresh();
     } catch (e) { setMsg((e as Error).message); setBusy(false); }
   }

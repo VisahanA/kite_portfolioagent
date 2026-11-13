@@ -3,38 +3,37 @@
 import { useState } from "react";
 import { BROKERS, type Broker, type ExtHolding } from "../lib/brokers";
 import { Donut, CAT } from "./charts";
+import { apiJson } from "./client";
+import { inr, num, pct } from "./format";
 import type { Report } from "../lib/types";
 
-const inr = (n: number) => (n < 0 ? "-" : "") + "₹" + Math.abs(Math.round(n)).toLocaleString("en-IN");
-const pct = (n: number) => (n >= 0 ? "+" : "") + n.toFixed(1) + "%";
+type Saved = { holdings: ExtHolding[]; report: Report | null };
 const brokerIds = Object.keys(BROKERS) as Broker[];
 
 const valueOf = (h: ExtHolding) => h.value ?? (h.price != null ? h.qty * h.price : h.avg != null ? h.qty * h.avg : 0);
 const costOf = (h: ExtHolding) => (h.avg != null ? h.qty * h.avg : null);
 
-export default function Imports({ held, onChange: setHeld, fx, setFx: setFxSaved, kiteValue, totalValue, totalCost, ext_lines }: { held: ExtHolding[]; onChange: (h: ExtHolding[], report?: Report) => void; fx: number; setFx: (n: number) => void; kiteValue: number; kiteCost: number; totalValue: number; totalCost: number; ext_lines?: Report["ext_lines"] }) {
+export default function Imports({ held, onChange: setHeld, fx, setFx: setFxSaved, kiteValue, ext_lines }: { held: ExtHolding[]; onChange: (h: ExtHolding[], report: Report | null) => void; fx: number; setFx: (n: number) => void; kiteValue: number; ext_lines?: Report["ext_lines"] }) {
   const [broker, setBroker] = useState<Broker>("axis");
   const [file, setFile] = useState<File | null>(null);
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [over, setOver] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [preview, setPreview] = useState<{ broker: Broker; rows: ExtHolding[]; method: string } | null>(null);
   const pick = (f: File) => {
     if (!/\.(pdf|csv)$/i.test(f.name) && f.type !== "application/pdf" && f.type !== "text/csv") { setMsg({ ok: false, text: "Choose a PDF or CSV file." }); return; }
     setFile(f); setPreview(null); setMsg(null);
   };
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  const [preview, setPreview] = useState<{ broker: Broker; rows: ExtHolding[]; method: string } | null>(null);
   const rate = (h: ExtHolding) => (h.currency === "USD" ? fx : 1);
 
   async function parse() {
-    if (!file) { setMsg({ ok: false, text: "Choose a PDF first." }); return; }
+    if (!file) { setMsg({ ok: false, text: "Choose a PDF or CSV file first." }); return; }
     setBusy(true); setMsg(null); setPreview(null);
     try {
       const fd = new FormData();
       fd.set("broker", broker); fd.set("file", file); if (password) fd.set("password", password);
-      const res = await fetch("/api/external/parse", { method: "POST", body: fd });
-      const d = await res.json();
-      if (!res.ok) throw new Error(d.error ?? res.statusText);
+      const d = await apiJson<{ holdings: ExtHolding[]; method: string }>("/api/external/parse", { method: "POST", body: fd });
       setPreview({ broker, rows: d.holdings, method: d.method });
     } catch (e) { setMsg({ ok: false, text: (e as Error).message }); }
     setBusy(false);
@@ -44,9 +43,7 @@ export default function Imports({ held, onChange: setHeld, fx, setFx: setFxSaved
     if (!preview) return;
     setBusy(true);
     try {
-      const res = await fetch(`/api/external?fx=${fx}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ broker: preview.broker, holdings: preview.rows }) });
-      const d = await res.json();
-      if (!res.ok) throw new Error(d.error ?? res.statusText);
+      const d = await apiJson<Saved>(`/api/external?fx=${fx}`, { method: "PUT", json: { broker: preview.broker, holdings: preview.rows } });
       setHeld(d.holdings, d.report); setPreview(null); setFile(null); setPassword("");
       setMsg({ ok: true, text: `${BROKERS[preview.broker].label}: ${preview.rows.length} holdings added to your portfolio.` });
     } catch (e) { setMsg({ ok: false, text: (e as Error).message }); }
@@ -54,8 +51,10 @@ export default function Imports({ held, onChange: setHeld, fx, setFx: setFxSaved
   }
 
   async function remove(b: Broker) {
-    const res = await fetch(`/api/external?broker=${b}&fx=${fx}`, { method: "DELETE" });
-    if (res.ok) { const d = await res.json(); setHeld(d.holdings, d.report); }
+    try {
+      const d = await apiJson<Saved>(`/api/external?broker=${b}&fx=${fx}`, { method: "DELETE" });
+      setHeld(d.holdings, d.report);
+    } catch (e) { setMsg({ ok: false, text: (e as Error).message }); }
   }
 
   const patch = (i: number, p: Partial<ExtHolding>) => setPreview((v) => v && { ...v, rows: v.rows.map((r, x) => (x === i ? { ...r, ...p } : r)) });
@@ -72,7 +71,6 @@ export default function Imports({ held, onChange: setHeld, fx, setFx: setFxSaved
   const extValue = by.reduce((a, x) => a + x.value, 0);
   const grand = kiteValue + extValue;
   const slices = [{ label: "Zerodha (Kite)", value: kiteValue, color: CAT[0] }, ...by.filter((x) => x.value > 0).map((x) => ({ label: BROKERS[x.b].label, value: x.value, color: x.color }))];
-  void totalValue; void totalCost;
 
   return (<>
     <div className="grid g4">
@@ -153,8 +151,8 @@ export default function Imports({ held, onChange: setHeld, fx, setFx: setFxSaved
             const v = liveVal(h), c = liveCost(h);
             return (<tr key={i}>
               <td><b>{h.symbol}</b><div className="sm muted">{h.name !== h.symbol ? h.name : ""}</div></td>
-              <td className="n num">{h.qty.toLocaleString("en-IN", { maximumFractionDigits: 6 })}</td>
-              <td className="n num">{h.avg != null ? `${h.currency === "USD" ? "$" : "₹"}${h.avg.toLocaleString("en-IN", { maximumFractionDigits: 2 })}` : "–"}</td>
+              <td className="n num">{num(h.qty, 6)}</td>
+              <td className="n num">{h.avg != null ? `${h.currency === "USD" ? "$" : "₹"}${num(h.avg, 2)}` : "–"}</td>
               <td className="n num">{inr(v)}<div className="sm muted">{((v / grand) * 100).toFixed(1)}% of all</div></td>
               <td className={"n num " + (c ? (v >= c ? "pos" : "neg") : "muted")}>{c ? pct(((v - c) / c) * 100) : "–"}</td>
             </tr>);

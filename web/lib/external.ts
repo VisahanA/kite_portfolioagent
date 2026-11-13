@@ -1,13 +1,11 @@
-import fs from "node:fs";
 import { extractText, getDocumentProxy } from "unpdf";
-import { hasClaude, llm } from "./llm";
-import { readJson, sessionFile } from "./session";
-
-import { BROKERS, isBroker, type Broker, type ExtHolding } from "./brokers";
-export { BROKERS, isBroker, type Broker, type ExtHolding };
+import { BROKERS, toHoldings, type Broker, type ExtHolding } from "./brokers";
+import { hasClaude, llmJson } from "./llm";
+import { sessionFile } from "./session";
+import { readJson, writeJson } from "./store";
 
 export const loadExternal = (sid: string | null): ExtHolding[] => (sid ? readJson<ExtHolding[]>(sessionFile(sid, "external")) ?? [] : []);
-export const saveExternal = (sid: string, h: ExtHolding[]) => fs.writeFileSync(sessionFile(sid, "external"), JSON.stringify(h));
+const saveExternal = (sid: string, h: ExtHolding[]) => writeJson(sessionFile(sid, "external"), h);
 
 /** Replace everything previously imported for `broker` with `rows`. */
 export function replaceBroker(sid: string, broker: Broker, rows: ExtHolding[]): ExtHolding[] {
@@ -16,7 +14,7 @@ export function replaceBroker(sid: string, broker: Broker, rows: ExtHolding[]): 
   return next;
 }
 
-export async function pdfText(buf: Uint8Array, password?: string): Promise<string> {
+async function pdfText(buf: Uint8Array, password?: string): Promise<string> {
   const pdf = await getDocumentProxy(buf, password ? { password } : {});
   const { text } = await extractText(pdf, { mergePages: false });
   return (Array.isArray(text) ? text : [text]).join("\n");
@@ -54,7 +52,7 @@ function headerCols(s: string): Col[] {
   return cols;
 }
 /** Parse a CSV export (Axis Direct etc.): header cells are mapped with the same titles as the PDF parser. */
-export function fromCsv(text: string, broker: Broker): ExtHolding[] {
+function fromCsv(text: string, broker: Broker): ExtHolding[] {
   const meta = BROKERS[broker];
   const src = text.replace(/^﻿/, "");
   const first = src.split(/\r?\n/, 1)[0] ?? "";
@@ -103,7 +101,7 @@ const tokNum = (t: string): number | null => {
 };
 const ISO = /^(USD|INR|EUR|GBP|AED|SGD)$/;
 
-export function byHeader(text: string, broker: Broker): ExtHolding[] {
+function byHeader(text: string, broker: Broker): ExtHolding[] {
   const meta = BROKERS[broker];
   const lines = text.split(/\r?\n/).map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean);
   // 1. find the header: one to three consecutive lines that name a quantity column and at least two other numeric columns
@@ -155,7 +153,7 @@ export function byHeader(text: string, broker: Broker): ExtHolding[] {
   return out;
 }
 
-export function heuristic(text: string, broker: Broker): ExtHolding[] {
+function heuristic(text: string, broker: Broker): ExtHolding[] {
   const meta = BROKERS[broker], out: ExtHolding[] = [];
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.replace(/[₹$]|INR|USD|Rs\.?/gi, " ").replace(/\s+/g, " ").trim();
@@ -189,17 +187,13 @@ export function heuristic(text: string, broker: Broker): ExtHolding[] {
 // ---------- optional model parser (used only when the heuristic finds nothing) ----------
 async function viaModel(text: string, broker: Broker): Promise<ExtHolding[]> {
   const meta = BROKERS[broker];
-  const reply = await llm(
+  const rows = await llmJson<Partial<ExtHolding>[]>(
     "You extract holdings from broker statements. Reply with a JSON array only.",
     `Broker: ${meta.label} (${meta.currency}, ${meta.assetClass}). From this statement text list every current holding as {"symbol":string,"name":string,"qty":number,"avg":number|null (average buy price per unit),"price":number|null (last price per unit),"value":number|null (current value)}. Ignore totals, transactions, charges and cash. Text:\n${text.slice(0, 30000)}`,
     4000,
+    "array",
   );
-  const arr = JSON.parse(reply.slice(reply.indexOf("["), reply.lastIndexOf("]") + 1));
-  return (arr as Partial<ExtHolding>[]).filter((x) => x.symbol && Number(x.qty) > 0).map((x) => ({
-    broker, symbol: String(x.symbol).toUpperCase(), name: String(x.name ?? x.symbol), qty: Number(x.qty),
-    avg: x.avg != null ? Number(x.avg) : null, price: x.price != null ? Number(x.price) : null, value: x.value != null ? Number(x.value) : null,
-    currency: meta.currency, assetClass: meta.assetClass,
-  }));
+  return toHoldings(rows.map((x) => ({ ...x, currency: undefined, assetClass: undefined })), broker); // currency/class come from the broker
 }
 
 export async function parseStatement(buf: Uint8Array, broker: Broker, password?: string, kind: "pdf" | "csv" = "pdf"): Promise<{ holdings: ExtHolding[]; method: "table" | "claude"; chars: number }> {

@@ -1,9 +1,9 @@
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { argName, callText, type Tool } from "./mcp";
+import { r1, r2 } from "./num";
 import type { Technicals } from "./types";
 
 export type Candle = { t: string; o: number; h: number; l: number; c: number; v: number };
-export type Tool = { name: string; inputSchema?: { properties?: Record<string, unknown> } };
-const textOf = (res: unknown) => ((res as { content?: { type: string; text?: string }[] }).content ?? []).map((b) => (b.type === "text" ? b.text ?? "" : "")).join("");
 const ymd = (d: Date) => d.toISOString().slice(0, 10);
 
 /** Build historical-candle arguments from whatever the server's tool schema calls its parameters. */
@@ -11,8 +11,7 @@ function historicalCall(tools: Tool[], token: number, exchange: string, symbol: 
   const dedicated = tools.find((t) => /historical/i.test(t.name) && t.name !== "market");
   const tool = dedicated ?? tools.find((t) => t.name === "market");
   if (!tool) throw new Error(`No historical-data tool on the Kite server (has: ${tools.map((t) => t.name).join(", ")})`);
-  const props = Object.keys(tool.inputSchema?.properties ?? {});
-  const pick = (re: RegExp) => props.find((p) => re.test(p));
+  const pick = (re: RegExp) => argName(tool, re);
   const args: Record<string, unknown> = {};
   const mode = pick(/^mode$/);
   if (mode && !dedicated) args[mode] = "historical";
@@ -46,13 +45,9 @@ function parseCandles(text: string): Candle[] {
 
 export async function fetchCandles(client: Client, tools: Tool[], token: number, exchange: string, symbol: string): Promise<Candle[]> {
   const to = new Date(), from = new Date(to.getTime() - 430 * 864e5); // ~14 months
-  const res = await client.callTool(historicalCall(tools, token, exchange, symbol, from, to));
-  const text = textOf(res);
-  if ((res as { isError?: boolean }).isError) throw new Error(text.slice(0, 200) || "Kite historical error");
-  return parseCandles(text);
+  return parseCandles(await callText(client, historicalCall(tools, token, exchange, symbol, from, to), "Kite historical error"));
 }
 
-const r1 = (n: number) => Math.round(n * 10) / 10, r2 = (n: number) => Math.round(n * 100) / 100;
 const sma = (c: number[], n: number) => (c.length >= n ? c.slice(-n).reduce((a, b) => a + b, 0) / n : NaN);
 function rsi(c: number[], n = 14) {
   if (c.length <= n) return NaN;

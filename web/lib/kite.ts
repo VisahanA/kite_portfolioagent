@@ -1,79 +1,50 @@
 import fs from "node:fs";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { UnauthorizedError, type OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
-import type { OAuthClientInformationMixed, OAuthClientMetadata, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { readJson, sessionFile } from "./session";
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { callText, connectMcp, dataArray, StoredOAuthProvider, type OAuthStore, type Raw, type Tool } from "./mcp";
+import { sessionFile } from "./session";
+import { readJson, writeJson } from "./store";
 
 const MCP_URL = process.env.KITE_MCP_URL || "https://mcp.kite.trade/mcp";
 // Deployed: set APP_URL (e.g. https://portfolio.example.com). Locally the redirect is derived from the request origin.
-export const redirectFor = (origin: string) => process.env.KITE_OAUTH_REDIRECT || `${process.env.APP_URL || origin}/api/kite/callback`;
+const redirectFor = (origin: string) => process.env.KITE_OAUTH_REDIRECT || `${process.env.APP_URL || origin}/api/kite/callback`;
 
-type Store = { client?: OAuthClientInformationMixed; tokens?: OAuthTokens; verifier?: string };
-const read = (sid: string): Store => readJson<Store>(sessionFile(sid, "oauth")) ?? {};
-const write = (sid: string, s: Store) => fs.writeFileSync(sessionFile(sid, "oauth"), JSON.stringify(s, null, 2));
-
-class Provider implements OAuthClientProvider {
-  authUrl: URL | null = null;
-  constructor(private sid: string, private redirect: string) {}
-  get redirectUrl() { return this.redirect; }
-  get clientMetadata(): OAuthClientMetadata {
-    return { client_name: "Portfolio Agent", redirect_uris: [this.redirect], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: "none" };
-  }
-  clientInformation() {
-    const c = read(this.sid).client as { redirect_uris?: string[] } | undefined;
-    return c && c.redirect_uris?.includes(this.redirect) ? (c as OAuthClientInformationMixed) : undefined; // re-register if the app URL changed
-  }
-  saveClientInformation(c: OAuthClientInformationMixed) { write(this.sid, { ...read(this.sid), client: c }); }
-  tokens() { return read(this.sid).tokens; }
-  saveTokens(t: OAuthTokens) { write(this.sid, { ...read(this.sid), tokens: t }); }
-  saveCodeVerifier(v: string) { write(this.sid, { ...read(this.sid), verifier: v }); }
-  codeVerifier() { return read(this.sid).verifier ?? ""; }
-  redirectToAuthorization(u: URL) { this.authUrl = u; }
-}
+const providerFor = (sid: string, origin: string) => {
+  const file = sessionFile(sid, "oauth");
+  return new StoredOAuthProvider(redirectFor(origin), "Portfolio Agent", () => readJson<OAuthStore>(file) ?? {}, (s) => writeJson(file, s, { pretty: true }));
+};
 
 // One live MCP client per browser session; survives Next dev hot reloads.
-type Live = { client: Client };
-type Pending = { transport: StreamableHTTPClientTransport };
-const g = globalThis as unknown as { __kiteLive?: Map<string, Live>; __kitePend?: Map<string, Pending> };
-// New global names + instanceof guard: an older build kept a single object under the previous names across hot reloads.
+const g = globalThis as unknown as { __kiteLive?: Map<string, Client>; __kitePend?: Map<string, StreamableHTTPClientTransport> };
+// instanceof guard: an older build kept a different object under these names across hot reloads.
 const live = () => (g.__kiteLive instanceof Map ? g.__kiteLive : (g.__kiteLive = new Map()));
 const pending = () => (g.__kitePend instanceof Map ? g.__kitePend : (g.__kitePend = new Map()));
 
-export type Connect = { client: Client } | { authUrl: string };
-
-export async function connect(sid: string, origin: string): Promise<Connect> {
+export async function connect(sid: string, origin: string): Promise<{ client: Client } | { authUrl: string }> {
   const hit = live().get(sid);
-  if (hit) return { client: hit.client };
-  const provider = new Provider(sid, redirectFor(origin));
-  const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), { authProvider: provider });
-  const client = new Client({ name: "portfolio-agent", version: "0.2.0" });
-  try {
-    await client.connect(transport);
-  } catch (e) {
-    if (e instanceof UnauthorizedError && provider.authUrl) {
-      pending().set(sid, { transport });
-      return { authUrl: provider.authUrl.toString() };
-    }
-    throw e;
+  if (hit) return { client: hit };
+  const c = await connectMcp(MCP_URL, providerFor(sid, origin), "0.2.0");
+  if ("authUrl" in c) {
+    pending().set(sid, c.transport);
+    return { authUrl: c.authUrl };
   }
-  live().set(sid, { client });
-  return { client };
+  live().set(sid, c.client);
+  return c;
 }
 
 /** Called by the OAuth redirect: exchange the code, then the next connect() succeeds. */
 export async function finishAuth(sid: string, code: string) {
   const p = pending().get(sid);
   if (!p) throw new Error("No pending Kite login for this browser. Click Connect Kite again.");
-  await p.transport.finishAuth(code);
+  await p.finishAuth(code);
   pending().delete(sid);
 }
 
 /** The already-connected Kite client for this browser, or null. Never starts a login. */
-export const liveClient = (sid: string): Client | null => live().get(sid)?.client ?? null;
+export const liveClient = (sid: string): Client | null => live().get(sid) ?? null;
 
 export function disconnect(sid: string) {
-  live().get(sid)?.client.close().catch(() => {});
+  live().get(sid)?.close().catch(() => {});
   live().delete(sid);
 }
 
@@ -81,29 +52,19 @@ export function disconnect(sid: string) {
 export function logout(sid: string) {
   disconnect(sid);
   pending().delete(sid);
-  for (const k of ["oauth", "report", "extscreen"] as const) try { fs.rmSync(sessionFile(sid, k), { force: true }); } catch {}
+  for (const k of ["oauth", "report", "extscreen"] as const) try { fs.rmSync(sessionFile(sid, k), { force: true }); } catch { /* best effort */ }
 }
 
-export type Raw = Record<string, unknown>;
-function textOf(res: unknown): string {
-  const c = (res as { content?: { type: string; text?: string }[] }).content ?? [];
-  return c.map((b) => (b.type === "text" ? b.text ?? "" : "")).join("");
-}
-
-export async function callHoldings(client: Client): Promise<Raw[]> {
-  const tools = (await client.listTools()).tools;
+export async function callHoldings(client: Client, tools: Tool[]): Promise<Raw[]> {
   const direct = tools.find((t) => /^(get_)?holdings$/.test(t.name));
-  const consolidated = tools.find((t) => t.name === "portfolio");
-  if (!direct && !consolidated) throw new Error(`No holdings tool found. Server offers: ${tools.map((t) => t.name).join(", ")}`);
+  if (!direct && !tools.some((t) => t.name === "portfolio")) throw new Error(`No holdings tool found. Server offers: ${tools.map((t) => t.name).join(", ")}`);
   const all: Raw[] = [];
   for (let from = 0, guard = 0; guard < 20; guard++) {
-    const res = await client.callTool(direct ? { name: direct.name, arguments: {} } : { name: "portfolio", arguments: { mode: "holdings", from } });
-    const text = textOf(res);
-    if ((res as { isError?: boolean }).isError) throw new Error(text || "Kite returned an error");
+    const text = await callText(client, direct ? { name: direct.name, arguments: {} } : { name: "portfolio", arguments: { mode: "holdings", from } }, "Kite returned an error");
     let json: unknown;
     try { json = JSON.parse(text); } catch { throw new Error(text.slice(0, 300) || "Kite returned non-JSON"); }
-    const data = Array.isArray(json) ? json : (json as { data?: Raw[] }).data;
-    if (!Array.isArray(data)) throw new Error("Unexpected holdings response shape");
+    const data = dataArray(json);
+    if (!data) throw new Error("Unexpected holdings response shape");
     all.push(...data);
     const pg = (json as { pagination?: { has_more?: boolean; returned?: number } }).pagination;
     if (!pg?.has_more) break;
@@ -111,4 +72,3 @@ export async function callHoldings(client: Client): Promise<Raw[]> {
   }
   return all;
 }
-

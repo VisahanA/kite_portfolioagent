@@ -1,11 +1,9 @@
+import type { Scoring } from "./defaults";
+import { clamp } from "./num";
 import type { ScreenResult } from "./types";
-import { loadScoring } from "./rules";
 
-const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
-
-/** Quant score for a screened stock. Every weight and threshold comes from the "scoring" block in screen-rules.json. */
-export function quantScore(r: ScreenResult) {
-  const s = loadScoring();
+/** Quant score (-100..100) for a screened stock. Every weight and threshold comes from the "scoring" block in screen-rules.json. */
+export function quantScore(r: ScreenResult, s: Scoring) {
   const t = r.technicals;
   const parts: { label: string; pts: number }[] = [];
   if (t) {

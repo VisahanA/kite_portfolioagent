@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { isBroker, parseStatement } from "../../../../lib/external";
+import { isBroker } from "../../../../lib/brokers";
+import { parseStatement } from "../../../../lib/external";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;

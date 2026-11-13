@@ -1,60 +1,58 @@
-import fs from "node:fs";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { callHoldings, connect, disconnect, liveClient, type Raw } from "./kite";
-import { loadExternal } from "./external";
-import { canonical, resolveAliases } from "./canon";
-import { fetchCandles, technicals, type Tool } from "./market";
-import { getFundamentals } from "./fundamentals";
-import { fetchUsCandles, fetchUsFundamentals, resolveUsTicker } from "./us";
 import type { ExtHolding } from "./brokers";
-import { loadRules, symbolOf } from "./data";
-import { quantScore } from "./quant";
-import { readJson, sessionFile } from "./session";
+import { canonical, resolveAliases, tickerOf } from "./canon";
+import { screenRules } from "./defaults";
+import { loadExternal } from "./external";
+import { getFundamentals } from "./fundamentals";
+import { callHoldings, connect, disconnect, liveClient } from "./kite";
+import { fetchCandles, technicals, type Candle } from "./market";
+import { callJson, dataArray, type Raw, type Tool } from "./mcp";
+import { isNum, r2, sum } from "./num";
+import { DEFAULT_FX, symbolOf, type HoldingLine } from "./portfolio";
+import { loadRules } from "./rules";
+import { sessionFile } from "./session";
+import { readJson, writeJson } from "./store";
+import { fetchUsCandles, resolveUsTicker, usFundamentals } from "./us";
 import type { Check, Fundamentals, Report, ScreenResult, Technicals, Verdict } from "./types";
 
+type Rules = Record<string, unknown>;
 const NIFTY = { exchange: "NSE", symbol: "NIFTY 50", token: 256265 }; // NSE index token, same for every account
-type Rules = Record<string, Record<string, unknown> | number | undefined>;
-const sect = (r: Rules, k: string) => (r[k] ?? {}) as Record<string, number | boolean | string[] | null | undefined>;
-const lim = (v: unknown, d: number | null) => (v === undefined ? d : (v as number | null)); // null switches a check off
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// ---------- rule checks ----------
 function verdict(checks: Check[]): Verdict {
   if (!checks.length) return { verdict: "n/a", checks };
   const p = checks.filter((c) => c.pass).length;
   return { verdict: p === checks.length ? "pass" : p === 0 ? "fail" : "mixed", checks };
 }
 const chk = (label: string, value: unknown, op: ">=" | "<=" | "in", limit: unknown, pass: boolean): Check => ({ label, value, op, limit, pass });
-const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
 
-export function score(id: string, ltp: number, t: Technicals | null, f: Fundamentals | null, rules: Rules): Omit<ScreenResult, "sources" | "holding" | "score"> {
+/** Measure one held stock against the user's rules. A null limit in the rules switches that check off. */
+export function screenStock(id: string, ltp: number, t: Technicals | null, f: Fundamentals | null, rules: Rules): ScreenResult {
+  const { entry: e, valuation: v, quality: q, growth: g } = screenRules(rules);
   const na: Verdict = { verdict: "n/a", checks: [] };
   const checks = { entry: na, valuation: na, quality: na, growth: na };
   if (t) {
-    const e = sect(rules, "entry"), cs: Check[] = [];
-    const allowed = (e.allowed_trends as string[] | undefined) ?? ["Uptrend", "Recovering"];
-    cs.push(chk(`Trend (${t.trend})`, t.trend, "in", allowed.join("/"), allowed.includes(t.trend)));
-    const rmin = lim(e.rsi_min, 35), rmax = lim(e.rsi_max, 60), ext = lim(e.max_pct_above_sma50, 5);
-    if (rmin != null) cs.push(chk("RSI(14) floor", t.rsi14, ">=", rmin, t.rsi14 >= rmin));
-    if (rmax != null) cs.push(chk("RSI(14) ceiling", t.rsi14, "<=", rmax, t.rsi14 <= rmax));
-    if (ext != null) cs.push(chk("% above SMA50 (not extended)", t.pct_vs_sma50, "<=", ext, t.pct_vs_sma50 <= ext));
+    const cs: Check[] = [];
+    cs.push(chk(`Trend (${t.trend})`, t.trend, "in", e.allowed_trends.join("/"), e.allowed_trends.includes(t.trend)));
+    if (e.rsi_min != null) cs.push(chk("RSI(14) floor", t.rsi14, ">=", e.rsi_min, t.rsi14 >= e.rsi_min));
+    if (e.rsi_max != null) cs.push(chk("RSI(14) ceiling", t.rsi14, "<=", e.rsi_max, t.rsi14 <= e.rsi_max));
+    if (e.max_pct_above_sma50 != null) cs.push(chk("% above SMA50 (not extended)", t.pct_vs_sma50, "<=", e.max_pct_above_sma50, t.pct_vs_sma50 <= e.max_pct_above_sma50));
     if (e.require_above_sma200) cs.push(chk("Above SMA200", t.pct_vs_sma200, ">=", 0, t.pct_vs_sma200 >= 0));
     checks.entry = verdict(cs);
   }
   if (f) {
-    const v = sect(rules, "valuation"), q = sect(rules, "quality"), g = sect(rules, "growth");
     const vc: Check[] = [], qc: Check[] = [], gc: Check[] = [];
-    const mpe = lim(v.max_pe, 40), mpb = lim(v.max_pb, 8), mpeg = lim(v.max_peg, 1.5);
-    if (mpe != null) vc.push(chk("P/E", f.pe, "<=", mpe, num(f.pe) && f.pe > 0 && f.pe <= mpe)); // loss-making (no / negative P/E) fails
-    if (mpeg != null && num(f.pe) && num(f.profit_growth_3y) && f.profit_growth_3y > 0) { const peg = Math.round((f.pe / f.profit_growth_3y) * 100) / 100; vc.push(chk("PEG (P/E / 3y profit growth)", peg, "<=", mpeg, peg <= mpeg)); }
-    if (mpb != null && num(f.pb)) vc.push(chk("P/B", f.pb, "<=", mpb, f.pb <= mpb));
-    const roe = lim(q.min_roe, 15), roce = lim(q.min_roce, 15), de = lim(q.max_debt_to_equity, 1);
-    if (roe != null) qc.push(chk("ROE %", f.roe, ">=", roe, num(f.roe) && f.roe >= roe));
+    if (v.max_pe != null) vc.push(chk("P/E", f.pe, "<=", v.max_pe, isNum(f.pe) && f.pe > 0 && f.pe <= v.max_pe)); // loss-making (no / negative P/E) fails
+    if (v.max_peg != null && isNum(f.pe) && isNum(f.profit_growth_3y) && f.profit_growth_3y > 0) { const peg = r2(f.pe / f.profit_growth_3y); vc.push(chk("PEG (P/E / 3y profit growth)", peg, "<=", v.max_peg, peg <= v.max_peg)); }
+    if (v.max_pb != null && isNum(f.pb)) vc.push(chk("P/B", f.pb, "<=", v.max_pb, f.pb <= v.max_pb));
+    if (q.min_roe != null) qc.push(chk("ROE %", f.roe, ">=", q.min_roe, isNum(f.roe) && f.roe >= q.min_roe));
     if (!f.is_financial) { // ROCE and D/E do not apply to banks, NBFCs and insurers
-      if (roce != null) qc.push(chk("ROCE %", f.roce, ">=", roce, num(f.roce) && f.roce >= roce));
-      if (de != null && num(f.debt_to_equity)) qc.push(chk("Debt / equity", f.debt_to_equity, "<=", de, f.debt_to_equity <= de));
+      if (q.min_roce != null) qc.push(chk("ROCE %", f.roce, ">=", q.min_roce, isNum(f.roce) && f.roce >= q.min_roce));
+      if (q.max_debt_to_equity != null && isNum(f.debt_to_equity)) qc.push(chk("Debt / equity", f.debt_to_equity, "<=", q.max_debt_to_equity, f.debt_to_equity <= q.max_debt_to_equity));
     }
-    const sg = lim(g.min_sales_growth_3y, 8), pg = lim(g.min_profit_growth_3y, 10);
-    if (sg != null) gc.push(chk("Sales growth 3y %", f.sales_growth_3y, ">=", sg, num(f.sales_growth_3y) && f.sales_growth_3y >= sg));
-    if (pg != null) gc.push(chk("Profit growth 3y %", f.profit_growth_3y, ">=", pg, num(f.profit_growth_3y) && f.profit_growth_3y >= pg));
+    if (g.min_sales_growth_3y != null) gc.push(chk("Sales growth 3y %", f.sales_growth_3y, ">=", g.min_sales_growth_3y, isNum(f.sales_growth_3y) && f.sales_growth_3y >= g.min_sales_growth_3y));
+    if (g.min_profit_growth_3y != null) gc.push(chk("Profit growth 3y %", f.profit_growth_3y, ">=", g.min_profit_growth_3y, isNum(f.profit_growth_3y) && f.profit_growth_3y >= g.min_profit_growth_3y));
     Object.assign(checks, { valuation: verdict(vc), quality: verdict(qc), growth: verdict(gc) });
   }
   let signal: string;
@@ -65,14 +63,30 @@ export function score(id: string, ltp: number, t: Technicals | null, f: Fundamen
     const entryOk = checks.entry.verdict === "pass";
     signal = fundOk ? (entryOk ? "ENTRY ZONE" : "WAIT FOR ENTRY") : entryOk ? "TECHNICAL ONLY" : "FAILS RULES";
   }
-  return { id, signal, ltp, checks, technicals: t ?? undefined, fundamentals: f ?? undefined };
+  return { id, sources: ["holding"], signal, ltp, checks, technicals: t ?? undefined, fundamentals: f ?? undefined };
 }
 
+// ---------- Kite holdings ----------
 export type Refresh =
   | { status: "auth"; authUrl: string }
   | { status: "ok"; report: Report; gaps: string[]; fetchedAt: string };
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+type KiteLine = HoldingLine & { exchange: string; symbol: string; token: number };
+
+/** One line per exchange:symbol (T+1 quantity included), largest value first. */
+function mergeKiteLines(raw: Raw[]): KiteLine[] {
+  const merged = new Map<string, KiteLine>();
+  for (const h of raw) {
+    const qty = Number(h.quantity) + Number(h.t1_quantity ?? 0);
+    if (!qty) continue;
+    const id = `${h.exchange}:${h.tradingsymbol}`;
+    const avg = Number(h.average_price), ltp = Number(h.last_price) || Number(h.close_price);
+    const m = merged.get(id) ?? { id, exchange: String(h.exchange), symbol: String(h.tradingsymbol), token: Number(h.instrument_token), qty: 0, avg: 0, cost: 0, value: 0, ltp };
+    m.qty += qty; m.cost += qty * avg; m.value += qty * ltp; m.ltp = ltp;
+    merged.set(id, m);
+  }
+  return [...merged.values()].map((m) => ({ ...m, avg: r2(m.cost / m.qty), value: r2(m.value), cost: r2(m.cost) })).sort((a, b) => b.value - a.value);
+}
 
 /** Pull this user's live holdings from Kite, then compute indicators and fundamentals for whatever they hold. Nothing is account-specific. */
 export async function refreshHoldings(sid: string, origin: string): Promise<Refresh> {
@@ -80,158 +94,154 @@ export async function refreshHoldings(sid: string, origin: string): Promise<Refr
   if ("authUrl" in c) return { status: "auth", authUrl: c.authUrl };
   const { client } = c;
   let raw: Raw[], tools: Tool[];
-  try { raw = await callHoldings(client); tools = (await client.listTools()).tools as Tool[]; } catch (e) { disconnect(sid); throw e; }
+  try {
+    tools = (await client.listTools()).tools as Tool[];
+    raw = await callHoldings(client, tools);
+  } catch (e) { disconnect(sid); throw e; }
 
-  // Merge lines that map to the same stock (same exchange:symbol, plus T+1 quantity).
-  const merged = new Map<string, { exchange: string; symbol: string; token: number; qty: number; cost: number; value: number; ltp: number }>();
-  for (const h of raw) {
-    const qty = Number(h.quantity) + Number(h.t1_quantity ?? 0);
-    if (!qty) continue;
-    const id = `${h.exchange}:${h.tradingsymbol}`;
-    const avg = Number(h.average_price), ltp = Number(h.last_price) || Number(h.close_price);
-    const m = merged.get(id) ?? { exchange: String(h.exchange), symbol: String(h.tradingsymbol), token: Number(h.instrument_token), qty: 0, cost: 0, value: 0, ltp };
-    m.qty += qty; m.cost += qty * avg; m.value += qty * ltp; m.ltp = ltp;
-    merged.set(id, m);
-  }
-  const hs = [...merged].map(([id, m]) => ({ id, ...m, avg: Math.round((m.cost / m.qty) * 100) / 100, value: Math.round(m.value * 100) / 100, cost: Math.round(m.cost * 100) / 100 })).sort((a, b) => b.value - a.value);
+  const hs = mergeKiteLines(raw);
   if (!hs.length) throw new Error("Kite returned no holdings for this account.");
-
-  const rules = loadRules() as Rules;
-  const maxAge = Number(rules.fundamentals_max_age_days ?? 30);
+  const rules = loadRules();
+  const cfg = screenRules(rules);
   const gaps: string[] = [];
 
-  // Market regime first (NIFTY 50), then each holding. Kite rate-limits historical data, so go one at a time.
-  const candlesOf = async (x: { token: number; exchange: string; symbol: string }) => {
-    try { return await fetchCandles(client, tools, x.token, x.exchange, x.symbol); }
-    catch (e) { await sleep(700); try { return await fetchCandles(client, tools, x.token, x.exchange, x.symbol); } catch (e2) { gaps.push(`${x.symbol}: candles unavailable (${(e2 as Error).message.slice(0, 80)})`); void e; return []; } }
+  // Market regime first (NIFTY 50), then each holding. Kite rate-limits historical data, so go one at a time, one retry each.
+  const candlesOf = async (x: { token: number; exchange: string; symbol: string }): Promise<Candle[]> => {
+    for (let attempt = 0; ; attempt++) {
+      try { return await fetchCandles(client, tools, x.token, x.exchange, x.symbol); } catch (e) {
+        if (attempt) { gaps.push(`${x.symbol}: candles unavailable (${(e as Error).message.slice(0, 80)})`); return []; }
+        await sleep(700);
+      }
+    }
   };
   const nt = technicals(await candlesOf(NIFTY));
   if (!nt) gaps.push("NIFTY 50: not enough candles, market caution unavailable");
-  const mrules = sect(rules, "market");
-  const caution = !!nt && (mrules.caution_when_nifty_downtrend ?? true) === true && nt.trend === "Downtrend";
+  const caution = !!nt && (cfg.market.caution_when_nifty_downtrend ?? true) === true && nt.trend === "Downtrend";
 
   const results: ScreenResult[] = [];
   for (const x of hs) {
     const t = technicals(await candlesOf(x), x.ltp);
     await sleep(350);
-    const f = await getFundamentals(x.symbol, x.ltp, maxAge);
+    const f = await getFundamentals(x.symbol, x.ltp, cfg.fundamentals_max_age_days);
     if (!f) gaps.push(`${x.symbol}: no fundamentals on screener.in`);
-    const base = score(x.id, x.ltp, t, f, rules);
-    const r: ScreenResult = { ...base, sources: ["holding"], score: 0, holding: { quantity: x.qty, average_price: x.avg, pnl: x.value - x.cost, pnl_pct: ((x.value - x.cost) / x.cost) * 100 } };
-    r.score = quantScore(r).score;
-    results.push(r);
+    results.push(screenStock(x.id, x.ltp, t, f, rules));
   }
 
-  const now = new Date();
+  const now = new Date().toISOString();
   const report: Report = {
-    generated_at: now.toISOString(),
+    generated_at: now,
     market: { id: `${NIFTY.exchange}:${NIFTY.symbol}`, technicals: nt ?? ({} as Technicals), caution },
-    holdings_by_value: hs.map((x) => ({ id: x.id, qty: x.qty, avg: x.avg, ltp: x.ltp, value: x.value, cost: x.cost })),
-    holdings_total_value: Math.round(hs.reduce((a, b) => a + b.value, 0) * 100) / 100,
-    holdings_total_cost: Math.round(hs.reduce((a, b) => a + b.cost, 0) * 100) / 100,
+    holdings_by_value: hs.map(({ id, qty, avg, ltp, value, cost }) => ({ id, qty, avg, ltp, value, cost })),
+    holdings_total_value: r2(sum(hs, (h) => h.value)),
+    holdings_total_cost: r2(sum(hs, (h) => h.cost)),
     results,
   };
-  fs.writeFileSync(sessionFile(sid, "report"), JSON.stringify(report));
-  return { status: "ok", report, gaps, fetchedAt: now.toISOString() };
+  writeJson(sessionFile(sid, "report"), report);
+  return { status: "ok", report, gaps, fetchedAt: now };
 }
 
-export const loadSessionReport = (sid: string | null): Report | null => (sid ? readJson<Report>(sessionFile(sid, "report")) : null);
-
+const loadSessionReport = (sid: string | null): Report | null => (sid ? readJson<Report>(sessionFile(sid, "report")) : null);
+const kiteSymbols = (sid: string) => (loadSessionReport(sid)?.holdings_by_value ?? []).map((h) => symbolOf(h.id));
 
 // ---------- imported holdings (other brokers) merged into the same report ----------
-type ExtScreen = Record<string, { t: Technicals | null; f: Fundamentals | null; ltp?: number; sym?: string; at: string }>;
-const isIndian = (h: { assetClass: string; currency: string }) => h.currency === "INR" && /indian/i.test(h.assetClass);
-const isUS = (h: { assetClass: string; currency: string }) => h.currency === "USD" && /us stock|equity/i.test(h.assetClass);
-// Canonical NSE symbol: drop exchange prefix/suffix (NSE:, .NS, .BO), series suffix (-EQ, -BE, -BZ, -T...) and punctuation.
-const cleanSym = (s: string) => s.toUpperCase().trim().replace(/^(NSE|BSE)[:\s]+/, "").replace(/\.(NS|NSE|BO|BSE)$/, "").replace(/-(EQ|BE|BZ|BL|SM|ST|T|N\d)$/, "").replace(/[^A-Z0-9&-]/g, "");
-const extId = (h: { broker: string; symbol: string; assetClass: string; currency: string }) => (isIndian(h) ? `NSE:${canonical(h.symbol)}` : `${h.broker.toUpperCase()}:${cleanSym(h.symbol) || h.symbol}`);
+type ExtEntry = { t: Technicals | null; f: Fundamentals | null; ltp?: number; sym?: string; at: string };
+type ExtScreen = Record<string, ExtEntry>;
+const loadExtScreen = (sid: string) => readJson<ExtScreen>(sessionFile(sid, "extscreen")) ?? {};
+const saveExtScreen = (sid: string, s: ExtScreen) => writeJson(sessionFile(sid, "extscreen"), s);
 
-async function marketJson(client: Client, args: Record<string, unknown>): Promise<unknown> {
-  const res = await client.callTool({ name: "market", arguments: args });
-  const text = ((res as { content?: { type: string; text?: string }[] }).content ?? []).map((b) => b.text ?? "").join("");
-  try { return JSON.parse(text); } catch { return null; }
-}
-const findObj = (j: unknown): Record<string, unknown> | null => {
-  const arr = Array.isArray(j) ? j : ((j as { data?: unknown })?.data as unknown[] | undefined);
-  const o = Array.isArray(arr) ? arr[0] : arr;
-  return o && typeof o === "object" ? (o as Record<string, unknown>) : null;
+const isIndian = (h: ExtHolding) => h.currency === "INR" && /indian/i.test(h.assetClass);
+const isUS = (h: ExtHolding) => h.currency === "USD" && /us stock|equity/i.test(h.assetClass);
+const extId = (h: ExtHolding) => (isIndian(h) ? `NSE:${canonical(h.symbol)}` : `${h.broker.toUpperCase()}:${tickerOf(h.symbol) || h.symbol}`);
+
+/** The first object of a reply that is an object, an array, or `{ data: object | array }`. */
+const firstObj = (j: unknown): Raw | null => {
+  const d = Array.isArray(j) ? j : (j as { data?: unknown } | null)?.data;
+  const o = Array.isArray(d) ? d[0] : d;
+  return o && typeof o === "object" ? (o as Raw) : null;
 };
 
 /** Find the NSE token and live price for an imported stock via the Kite instrument search. */
 async function lookup(client: Client, id: string, name: string): Promise<{ token: number; ltp?: number; sym?: string } | null> {
-  const pick = (o: Record<string, unknown> | null) => (o && Number(o.instrument_token) ? { token: Number(o.instrument_token), ltp: Number(o.last_price) || undefined, sym: o.tradingsymbol ? cleanSym(String(o.tradingsymbol)) : undefined } : null);
-  const a = pick(findObj(await marketJson(client, { mode: "search", search_mode: "get_by_id", id, include_live_quote: true }).catch(() => null)));
-  if (a) return a;
-  const j = await marketJson(client, { mode: "search", query: name, exchange: "NSE", limit: 5, include_live_quote: true }).catch(() => null);
-  const arr = ((Array.isArray(j) ? j : (j as { data?: unknown[] })?.data) ?? []) as Record<string, unknown>[];
+  const market = (args: Raw) => callJson(client, { name: "market", arguments: args }).catch(() => null);
+  const pick = (o: Raw | null) => (o && Number(o.instrument_token) ? { token: Number(o.instrument_token), ltp: Number(o.last_price) || undefined, sym: o.tradingsymbol ? tickerOf(String(o.tradingsymbol)) : undefined } : null);
+  const byId = pick(firstObj(await market({ mode: "search", search_mode: "get_by_id", id, include_live_quote: true })));
+  if (byId) return byId;
+  const arr = dataArray(await market({ mode: "search", query: name, exchange: "NSE", limit: 5, include_live_quote: true })) ?? [];
   return pick(arr.find((x) => String(x.exchange ?? "NSE") === "NSE" && /^EQ$|equity/i.test(String(x.segment ?? x.instrument_type ?? "EQ"))) ?? arr[0] ?? null);
 }
 
-/** Compute (or refresh) trend + fundamentals for imported Indian stocks. Without a live Kite client only fundamentals are fetched. */
-export async function screenExternal(sid: string, client: Client | null = liveClient(sid)): Promise<void> {
-  const all = loadExternal(sid);
-  const ext = all.filter(isIndian);
-  await screenUs(sid, all.filter(isUS));
-  // Singularise: map every spelling (names, typos, series suffixes) to one NSE symbol, using Kite's own symbols as the trusted set.
-  const kiteSyms = (loadSessionReport(sid)?.holdings_by_value ?? []).map((h) => symbolOf(h.id));
-  await resolveAliases(ext, kiteSyms).catch(() => {});
-  const cache = readJson<ExtScreen>(sessionFile(sid, "extscreen")) ?? {};
-  const maxAge = Number(((loadRules() as Rules).fundamentals_max_age_days as number) ?? 30);
-  let tools: Tool[] | null = null;
-  const next: ExtScreen = {};
-  for (const h of ext) {
-    const id = extId(h), prev = cache[id];
-    let t: Technicals | null = prev?.t ?? null, ltp = prev?.ltp, sym = prev?.sym;
-    if (client) {
-      try {
-        const hit = await lookup(client, id, h.name || h.symbol);
-        if (hit) {
-          ltp = hit.ltp ?? ltp; sym = hit.sym ?? sym; // resolved official ticker, e.g. "RELIANCE INDUSTRIES" -> RELIANCE
-          tools ??= (await client.listTools()).tools as Tool[];
-          t = technicals(await fetchCandles(client, tools, hit.token, "NSE", sym ?? canonical(h.symbol)), ltp);
-          await sleep(350);
-        }
-      } catch { /* keep any earlier result */ }
-    }
-    const f = await getFundamentals(sym ?? id.split(":")[1], ltp ?? h.price ?? h.avg ?? 0, maxAge).catch(() => null);
-    next[id] = { t, f, ltp, sym, at: new Date().toISOString() };
-  }
-  const prevAll = readJson<ExtScreen>(sessionFile(sid, "extscreen")) ?? {};
-  for (const [k, v] of Object.entries(prevAll)) if (k.includes(":") && !k.startsWith("NSE:") && !(k in next)) next[k] = v; // keep US entries written by screenUs
-  fs.writeFileSync(sessionFile(sid, "extscreen"), JSON.stringify(next));
-}
-
-/** US stocks (e.g. Vested): same technicals + fundamentals pipeline as Indian stocks, fed from Yahoo Finance instead of Kite/screener.in. */
-async function screenUs(sid: string, us: ExtHolding[]): Promise<void> {
-  const cache = readJson<ExtScreen>(sessionFile(sid, "extscreen")) ?? {};
-  const maxAge = Number(((loadRules() as Rules).fundamentals_max_age_days as number) ?? 30);
-  for (const h of us) {
-    const id = extId(h), prev = cache[id];
-    let { t, f, ltp, sym } = { t: prev?.t ?? null, f: prev?.f ?? null, ltp: prev?.ltp, sym: prev?.sym };
+/** Indian stock: trend from Kite candles (needs a live client), fundamentals from screener.in. Keeps earlier results on failure. */
+async function screenIndian(h: ExtHolding, id: string, prev: ExtEntry | undefined, client: Client | null, toolsOf: () => Promise<Tool[]>, maxAge: number): Promise<ExtEntry> {
+  let t = prev?.t ?? null, ltp = prev?.ltp, sym = prev?.sym;
+  if (client) {
     try {
-      sym ??= (await resolveUsTicker(cleanSym(h.symbol), h.name)) ?? undefined;
-      if (sym) {
-        const c = await fetchUsCandles(sym);
-        ltp = c.ltp ?? ltp;
-        t = technicals(c.candles, ltp) ?? t;
-        const stale = !f || (Date.now() - new Date(f.as_of).getTime()) / 864e5 > maxAge;
-        if (stale) f = (await fetchUsFundamentals(sym, ltp ?? h.price ?? h.avg ?? 0).catch(() => null)) ?? f;
+      const hit = await lookup(client, id, h.name || h.symbol);
+      if (hit) {
+        ltp = hit.ltp ?? ltp; sym = hit.sym ?? sym; // resolved official ticker, e.g. "RELIANCE INDUSTRIES" -> RELIANCE
+        t = technicals(await fetchCandles(client, await toolsOf(), hit.token, "NSE", sym ?? canonical(h.symbol)), ltp);
+        await sleep(350);
       }
     } catch { /* keep any earlier result */ }
-    cache[id] = { t, f, ltp, sym, at: new Date().toISOString() };
-    await sleep(300);
   }
-  fs.writeFileSync(sessionFile(sid, "extscreen"), JSON.stringify(cache));
+  const f = await getFundamentals(sym ?? symbolOf(id), ltp ?? h.price ?? h.avg ?? 0, maxAge).catch(() => null);
+  return { t, f, ltp, sym, at: new Date().toISOString() };
 }
 
+/** US stock (e.g. Vested): same technicals + fundamentals pipeline, fed from Yahoo Finance instead of Kite/screener.in. */
+async function screenUs(h: ExtHolding, prev: ExtEntry | undefined, maxAge: number): Promise<ExtEntry> {
+  let t = prev?.t ?? null, f = prev?.f ?? null, ltp = prev?.ltp, sym = prev?.sym;
+  try {
+    sym ??= (await resolveUsTicker(tickerOf(h.symbol), h.name)) ?? undefined;
+    if (sym) {
+      const c = await fetchUsCandles(sym);
+      ltp = c.ltp ?? ltp;
+      t = technicals(c.candles, ltp) ?? t;
+      f = await usFundamentals(sym, ltp ?? h.price ?? h.avg ?? 0, f, maxAge);
+    }
+  } catch { /* keep any earlier result */ }
+  return { t, f, ltp, sym, at: new Date().toISOString() };
+}
+
+/** Compute (or refresh) trend + fundamentals for imported stocks. Without a live Kite client, Indian stocks get fundamentals only. */
+export async function screenExternal(sid: string, client: Client | null = liveClient(sid)): Promise<void> {
+  const all = loadExternal(sid);
+  await ensureAliases(sid); // every spelling -> one NSE symbol before ids are built
+  const cache = loadExtScreen(sid);
+  const maxAge = screenRules(loadRules()).fundamentals_max_age_days;
+  let tools: Tool[] | null = null;
+  const toolsOf = async () => (tools ??= (await client!.listTools()).tools as Tool[]);
+  const next: ExtScreen = {}; // rebuilt from scratch, so removed holdings drop out of the cache
+  for (const h of all) {
+    const id = extId(h);
+    if (isUS(h)) { next[id] = await screenUs(h, cache[id], maxAge); await sleep(300); }
+    else if (isIndian(h)) next[id] = await screenIndian(h, id, cache[id], client, toolsOf, maxAge);
+  }
+  saveExtScreen(sid, next);
+}
+
+/** Resolve spelling variants of every imported stock to one NSE symbol, trusting Kite's own symbols (cached, so only the first call is slow). */
+export async function ensureAliases(sid: string | null): Promise<void> {
+  if (!sid) return;
+  const ext = loadExternal(sid).filter(isIndian);
+  if (ext.length) await resolveAliases(ext, kiteSymbols(sid)).catch(() => {});
+}
+
+/** Fold another position in the same stock into `line`. */
+function addTo(line: HoldingLine, qty: number, cost: number, value: number) {
+  line.qty += qty; line.cost += cost; line.value += value;
+  if (line.qty) line.avg = line.cost / line.qty;
+}
+
+const NO_FUNDAMENTALS = { as_of: "", source: "", pe: null, pb: null, roe: null, roce: null, debt_to_equity: null, sales_growth_3y: null, profit_growth_3y: null, dividend_yield: null, notes: "Imported holding" };
+
 /** The saved Kite report plus the user's imported holdings (USD converted at `fx`). Null until Kite has been connected once. */
-export function loadMergedReport(sid: string | null, fx = 88): Report | null {
+export function loadMergedReport(sid: string | null, fx = DEFAULT_FX): Report | null {
   const base = loadSessionReport(sid);
   if (!base || !sid) return base;
   const ext = loadExternal(sid);
   if (!ext.length) return base;
-  const cache = readJson<ExtScreen>(sessionFile(sid, "extscreen")) ?? {};
-  const rules = loadRules() as Rules;
+  const cache = loadExtScreen(sid);
+  const rules = loadRules();
   const lines = new Map(base.holdings_by_value.map((h) => [h.id, { ...h }]));
   const results = new Map(base.results.map((r) => [r.id, r]));
   const extLines: NonNullable<Report["ext_lines"]> = [];
@@ -244,14 +254,11 @@ export function loadMergedReport(sid: string | null, fx = 88): Report | null {
     const cost = h.avg != null ? h.qty * h.avg * k : value;
     extLines.push({ broker: h.broker, symbol: h.symbol, value, cost, live: !!c?.ltp });
     const cur = lines.get(id);
-    if (cur) { cur.qty += h.qty; cur.cost += cost; cur.value += value; cur.avg = cur.cost / cur.qty; } // same stock also held on Kite
+    if (cur) addTo(cur, h.qty, cost, value); // same stock also held on Kite
     else lines.set(id, { id, qty: h.qty, avg: cost / h.qty, ltp: px || cost / h.qty, value, cost, imported: true });
     if (!results.has(id)) {
-      const sc = score(id, px, c?.t ?? null, c?.f ?? null, rules);
-      const line = lines.get(id)!;
-      const r: ScreenResult = { ...sc, sources: ["holding"], score: 0, holding: { quantity: line.qty, average_price: line.avg, pnl: line.value - line.cost, pnl_pct: line.cost > 0 ? ((line.value - line.cost) / line.cost) * 100 : 0 } };
-      if (!c?.f && !isIndian(h) && !isUS(h)) r.fundamentals = { as_of: "", source: "", sector: h.assetClass, pe: null, pb: null, roe: null, roce: null, debt_to_equity: null, sales_growth_3y: null, profit_growth_3y: null, dividend_yield: null, notes: "Imported holding" };
-      r.score = quantScore(r).score;
+      const r = screenStock(id, px, c?.t ?? null, c?.f ?? null, rules);
+      if (!c?.f && !isIndian(h) && !isUS(h)) r.fundamentals = { ...NO_FUNDAMENTALS, sector: h.assetClass }; // e.g. crypto: shows the asset class as sector
       results.set(id, r);
     }
   }
@@ -263,23 +270,13 @@ export function loadMergedReport(sid: string | null, fx = 88): Report | null {
     const ck = canonical(m[2]), first = seen.get(ck);
     if (!first) { seen.set(ck, id); continue; }
     const t = lines.get(first)!;
-    t.qty += l.qty; t.cost += l.cost; t.value += l.value; t.avg = t.qty ? t.cost / t.qty : t.avg; t.imported = t.imported && l.imported;
+    addTo(t, l.qty, l.cost, l.value);
+    t.imported = t.imported && l.imported;
     lines.delete(id); results.delete(id);
-    const r = results.get(first);
-    if (r?.holding) r.holding = { quantity: t.qty, average_price: t.avg, pnl: t.value - t.cost, pnl_pct: t.cost > 0 ? ((t.value - t.cost) / t.cost) * 100 : 0 };
   }
   const hv = [...lines.values()].sort((a, b) => b.value - a.value);
   return {
-    ...base, holdings_by_value: hv, holdings_total_value: hv.reduce((a, b) => a + b.value, 0), holdings_total_cost: hv.reduce((a, b) => a + b.cost, 0), results: [...results.values()],
-    ext_lines: extLines, kite_total_value: base.holdings_by_value.reduce((a, b) => a + b.value, 0), kite_total_cost: base.holdings_by_value.reduce((a, b) => a + b.cost, 0),
+    ...base, holdings_by_value: hv, holdings_total_value: sum(hv, (h) => h.value), holdings_total_cost: sum(hv, (h) => h.cost), results: [...results.values()],
+    ext_lines: extLines, kite_total_value: sum(base.holdings_by_value, (h) => h.value), kite_total_cost: sum(base.holdings_by_value, (h) => h.cost),
   };
-}
-
-/** Resolve spelling variants of every imported stock to one NSE symbol before rendering (cached, so only the first call is slow). */
-export async function ensureAliases(sid: string | null): Promise<void> {
-  if (!sid) return;
-  const ext = loadExternal(sid).filter(isIndian);
-  if (!ext.length) return;
-  const kite = (loadSessionReport(sid)?.holdings_by_value ?? []).map((h) => symbolOf(h.id));
-  await resolveAliases(ext, kite).catch(() => {});
 }

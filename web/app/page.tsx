@@ -1,8 +1,9 @@
 import Dashboard from "./Dashboard";
 import Landing from "./Landing";
-import { loadRules } from "../lib/data";
 import { loadExternal } from "../lib/external";
 import { hasClaude } from "../lib/llm";
+import { onlyHoldings } from "../lib/portfolio";
+import { loadRules } from "../lib/rules";
 import { ensureAliases, loadMergedReport } from "../lib/screen";
 import { peekSid } from "../lib/session";
 
@@ -13,7 +14,5 @@ export default async function Page() {
   await ensureAliases(sid);
   const report = loadMergedReport(sid);
   if (!report) return <Landing />;
-  const holdings = report.results.filter((r) => r.sources.includes("holding"));
-  const candidates = report.results.filter((r) => !r.sources.includes("holding"));
-  return <Dashboard report={{ ...report, results: holdings }} candidates={candidates} file={report.generated_at.slice(0, 10)} rules={loadRules()} claude={hasClaude()} external={loadExternal(sid)} />;
+  return <Dashboard report={onlyHoldings(report)} rules={loadRules()} claude={hasClaude()} external={loadExternal(sid)} />;
 }

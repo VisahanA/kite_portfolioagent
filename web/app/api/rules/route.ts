@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { loadRules } from "../../../lib/data";
-import { saveRules } from "../../../lib/rules";
+import { errorJson } from "../../../lib/api";
+import { loadRules, saveRules } from "../../../lib/rules";
 
 export const dynamic = "force-dynamic";
 
@@ -14,6 +14,6 @@ export async function PUT(req: Request) {
     if (typeof text !== "string") throw new Error("Missing rules text.");
     return NextResponse.json({ rules: saveRules(text) });
   } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 400 });
+    return errorJson(e, "Invalid rules", 400);
   }
 }

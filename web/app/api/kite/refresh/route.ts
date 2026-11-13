@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { errorJson, fxOf } from "../../../../lib/api";
 import { loadMergedReport, refreshHoldings, screenExternal } from "../../../../lib/screen";
 import { getSid } from "../../../../lib/session";
 
@@ -11,9 +12,8 @@ export async function POST(req: Request) {
     const out = await refreshHoldings(sid, new URL(req.url).origin);
     if (out.status !== "ok") return NextResponse.json(out);
     await screenExternal(sid).catch(() => {}); // refresh imported holdings' trend with the live Kite session
-    const fx = Number(new URL(req.url).searchParams.get("fx")) || 88;
-    return NextResponse.json({ ...out, report: loadMergedReport(sid, fx) ?? out.report });
+    return NextResponse.json({ ...out, report: loadMergedReport(sid, fxOf(req)) ?? out.report });
   } catch (e) {
-    return NextResponse.json({ error: (e as Error).message ?? "Kite refresh failed" }, { status: 502 });
+    return errorJson(e, "Kite refresh failed", 502);
   }
 }

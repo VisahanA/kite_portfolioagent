@@ -13,9 +13,8 @@ export type Fundamentals = {
   market_cap_cr?: number | null; is_financial?: boolean;
 };
 export type ScreenResult = {
-  id: string; sources: string[]; signal: string; score: number; ltp: number;
+  id: string; sources: string[]; signal: string; ltp: number;
   checks: Record<"entry" | "valuation" | "quality" | "growth", Verdict>;
-  holding?: { quantity: number; average_price: number; pnl: number; pnl_pct: number };
   technicals?: Technicals; fundamentals?: Fundamentals;
 };
 export type Report = {
@@ -40,6 +39,8 @@ export type Sentiment = {
 export type AgentStep = { agent: string; summary: string; score?: number; detail?: string[] };
 export type Stance = "Aligned positive" | "Aligned cautious" | "Conflicting: review" | "Neutral / mixed";
 export type Analysis = {
-  id: string; symbol: string; quantScore: number; newsScore: number; combined: number; stance: Stance;
+  id: string; symbol: string; quantScore: number; newsScore: number; stance: Stance;
+  /** (1 - newsWeight) × quant + newsWeight × news; newsWeight is 0 when there was no news. */
+  combined: number; newsWeight: number;
   steps: AgentStep[]; sentiment: Sentiment; reviewNotes: string[]; ranAt: string; synthesis: "claude" | "rules";
 };

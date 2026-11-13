@@ -5,7 +5,7 @@ import { cookies } from "next/headers";
 
 const COOKIE = "pa_sid";
 const SID = /^[a-f0-9]{32}$/;
-export const sessionDir = () => {
+const sessionDir = () => {
   const d = process.env.SESSION_DIR || path.resolve(process.cwd(), ".sessions"); // holds OAuth tokens + that user's report: gitignored
   fs.mkdirSync(d, { recursive: true });
   return d;
@@ -27,6 +27,5 @@ export async function getSid(): Promise<string> {
   return sid;
 }
 
-export const sessionFile = (sid: string, kind: "oauth" | "report" | "external" | "extscreen") => path.join(sessionDir(), `${sid}.${kind}.json`);
-
-export function readJson<T>(file: string): T | null { try { return JSON.parse(fs.readFileSync(file, "utf8")) as T; } catch { return null; } }
+export type SessionKind = "oauth" | "report" | "external" | "extscreen";
+export const sessionFile = (sid: string, kind: SessionKind) => path.join(sessionDir(), `${sid}.${kind}.json`);
