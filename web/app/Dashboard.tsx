@@ -147,8 +147,15 @@ export default function Dashboard({ report: initial, rules, claude, external }: 
   fxRef.current = fx;
   useEffect(() => {
     let busy = false;
+    // NSE/BSE hours: Mon–Fri 09:15–15:30 IST (evaluated in IST regardless of the browser's timezone).
+    const marketOpen = () => {
+      const p = Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Kolkata", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date()).map((x) => [x.type, x.value]));
+      if (p.weekday === "Sat" || p.weekday === "Sun") return false;
+      const mins = (Number(p.hour) % 24) * 60 + Number(p.minute);
+      return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
+    };
     const tick = async () => {
-      if (busy || runningRef.current || document.hidden) return;
+      if (busy || runningRef.current || document.hidden || !marketOpen()) return;
       busy = true;
       try {
         const data = await apiJson<{ status: "auth" } | { status: "ok"; report: Report; gaps: string[]; fetchedAt: string }>(`/api/kite/refresh?fx=${fxRef.current}`, { method: "POST" });
